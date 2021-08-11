@@ -94,12 +94,27 @@ time_t filetimeToUnixtime(FILETIME_T ft)
 }
 
 #define writeByte(b, fp, crc) writeTag(b, fp, crc)
+#define writeByteIoUring(b, fp, crc) writeTagIoUring(b, fp, crc);
+
+static size_t bufWrite(const void *ptr, size_t size, size_t count, WriteBuf_T *wb) {
+    memcpy(wb->buf + wb->off, ptr, size * count);
+    wb->off += size * count;
+    return size * count;
+}
 
 static size_t  writeTag(unsigned char tag, FILE *fp, uint32_t *crc)
 {
     size_t  n;
     n = fwrite(&tag, sizeof(unsigned char), 1, fp);
     CHECK_FWRITE_RETURN(n, 1)
+    *crc = crc32(*crc, &tag, 1);
+    return n;
+}
+
+static size_t  writeTagIoUring(unsigned char tag, WriteBuf_T *wb, uint32_t *crc)
+{
+    size_t n;
+    n = bufWrite(&tag, sizeof(unsigned char), 1, wb);
     *crc = crc32(*crc, &tag, 1);
     return n;
 }
@@ -113,6 +128,14 @@ static size_t writeTime(unsigned int t, FILE *fp, uint32_t *crc)
     return 4;
 }
 
+static size_t writeTimeIoUring(unsigned int t, WriteBuf_T *wb, uint32_t *crc)
+{
+    size_t n;
+    n = bufWrite(&t, sizeof(unsigned int), 1, wb);
+    *crc = crc32(*crc, (unsigned char *)&t, 4);
+    return n;
+}
+
 static size_t writeNumber(uint64_t u64, FILE *fp, uint32_t *crc)
 {
     uint64_t         size;
@@ -121,6 +144,17 @@ static size_t writeNumber(uint64_t u64, FILE *fp, uint32_t *crc)
     n = getUint64Bytes(u64, u64_bytes);
     size = fwrite(u64_bytes, sizeof(unsigned char), n, fp);
     CHECK_FWRITE_RETURN(size, n)
+    *crc = crc32(*crc, u64_bytes, n);
+    return size;
+}
+
+static size_t writeNumberIoUring(uint64_t u64, WriteBuf_T *wb, uint32_t *crc)
+{
+    uint64_t         size;
+    int              n;
+    unsigned char    u64_bytes[9];
+    n = getUint64Bytes(u64, u64_bytes);
+    size = bufWrite(u64_bytes, sizeof(unsigned char), n, wb);
     *crc = crc32(*crc, u64_bytes, n);
     return size;
 }
@@ -312,6 +346,20 @@ void printEndHeader(Qz7zEndHeader_T *eheader)
 }
 #endif
 
+static ssize_t getIoUringResult(struct io_uring *ring_)
+{
+    struct io_uring_cqe* cqe = NULL;
+    ssize_t res = 0;
+    if(io_uring_submit(ring_) != 1) {
+        QZ_ERROR("Io_Uring sumbit failed\n");
+        return -1;
+    }
+    io_uring_wait_cqe(ring_, &cqe);
+    res = cqe -> res;
+    io_uring_cqe_seen(ring_, cqe);
+    return res;
+}
+
 static int doCompressBuffer(QzSession_T *sess,
                             unsigned char *src, unsigned int *src_len,
                             unsigned char *dst, unsigned int *dst_len,
@@ -360,6 +408,77 @@ static int doCompressBuffer(QzSession_T *sess,
         bytes_written = fwrite(dst, 1, *dst_len, dst_file);
         CHECK_FWRITE_RETURN_FP(dst_file, bytes_written, *dst_len)
         *dst_file_size += bytes_written;
+
+        buf_processed += *src_len;
+        buf_remaining -= *src_len;
+        output_len += *dst_len;
+        if (0 == buf_remaining) {
+            done = 1;
+        }
+        src += *src_len;
+        QZ_DEBUG("src_len is %u ,buf_remaining is %u\n", *src_len,
+                 buf_remaining);
+        *src_len = buf_remaining;
+    }
+
+    *src_len = buf_processed;
+    *dst_len = output_len;
+    return ret;
+}
+
+static int doCompressBufferIoUring(QzSession_T *sess,
+                            unsigned char *src, unsigned int *src_len,
+                            unsigned char *dst, unsigned int *dst_len,
+                            RunTimeList_T *time_list, IoUringFile_T* dst_file,
+                            off_t *dst_file_size, int last, struct io_uring *ring_)
+{
+    int ret = QZ_FAIL;
+    unsigned int done = 0;
+    unsigned int buf_processed = 0;
+    unsigned int buf_remaining = *src_len;
+    ssize_t bytes_written;
+    unsigned int output_len = 0;
+    RunTimeList_T *time_node = time_list;
+    struct io_uring_sqe* sqe;
+
+    while (time_node->next) {
+        time_node = time_node->next;
+    }
+
+    while (!done) {
+        RunTimeList_T *run_time = calloc(1, sizeof(RunTimeList_T));
+        CHECK_ALLOC_RETURN_VALUE(run_time)
+        run_time->next = NULL;
+        time_node->next = run_time;
+        time_node = run_time;
+
+        gettimeofday(&run_time->time_s, NULL);
+
+        /* do actual work */
+        ret = qzCompress(sess, src, src_len, dst, dst_len, last);
+        if (QZ_BUF_ERROR == ret && 0 == *src_len) {
+            done = 1;
+        }
+        QZ_DEBUG("qzCompress returned: src_len=%u  dst_len=%u\n", *src_len,
+                 *dst_len);
+
+        if (ret != QZ_OK &&
+            ret != QZ_BUF_ERROR &&
+            ret != QZ_DATA_ERROR) {
+            QZ_ERROR("doCompressBuffer in qzip_7z.c :failed with error: %d\n",
+                     ret);
+            break;
+        }
+
+        gettimeofday(&run_time->time_e, NULL);
+
+        sqe = io_uring_get_sqe(ring_);
+        CHECK_GET_SQE(sqe)
+        io_uring_prep_write(sqe, dst_file->fd, dst, *dst_len, dst_file->off);
+        bytes_written = getIoUringResult(ring_);
+        CHECK_IO_URING_WRITE_RETURN(bytes_written, *dst_len, "write compress")
+        *dst_file_size += bytes_written;
+        dst_file->off += bytes_written;
 
         buf_processed += *src_len;
         buf_remaining -= *src_len;
@@ -724,10 +843,343 @@ exit:
     return ret;
 }
 
+int doCompressFileIoUring(QzSession_T *sess, Qz7zItemList_T *list,
+                   const char *dst_file_name, struct io_uring *ring_)
+{
+    int ret = OK;
+    struct stat src_file_stat;
+    unsigned int src_buffer_size = 0;
+    unsigned int dst_buffer_size = 0, dst_buffer_max_size = 0;
+    off_t src_file_size = 0, dst_file_size = 0, file_remaining = 0;
+    const char *src_file_name = NULL;
+    unsigned char *src_buffer = NULL;
+    unsigned char *dst_buffer = NULL;
+    IoUringFile_T *src_file = NULL;
+    IoUringFile_T *dst_file = NULL;
+    Qz7zEndHeader_T *eheader = NULL;
+    unsigned int bytes_read = 0;
+    unsigned long bytes_processed = 0;
+    unsigned int ratio_idx = 0;
+    const unsigned int ratio_limit =
+        sizeof(g_bufsz_expansion_ratio) / sizeof(unsigned int);
+    unsigned int read_more = 0;
+    int src_fd = 0;
+    uint64_t non_empty_number = 0;
+    RunTimeList_T *time_list_head = malloc(sizeof(RunTimeList_T));
+    Qz7zSignatureHeader_T *sheader = NULL;
+    WriteBuf_T *sheader_wb = NULL;
+    WriteBuf_T *eheader_wb = NULL;
+    struct io_uring_sqe *sqe = NULL;
+
+    if (!time_list_head) {
+        QZ_DEBUG("malloc time_list_head error\n");
+        ret = QZ7Z_ERR_OOM;
+        goto exit;
+    }
+    gettimeofday(&time_list_head->time_s, NULL);
+    time_list_head->time_e = time_list_head->time_s;
+    time_list_head->next = NULL;
+
+    size_t  total_compressed_size = 0;
+    int is_last;
+    int n_part; // how much parts can the src file be splited
+    int n_part_i;
+
+
+    dst_file = generateIoUringFileWithMode(dst_file_name, O_WRONLY | O_CREAT | O_TRUNC, S_IRWXU | S_IRWXO);
+    if (!dst_file) {
+        QZ_ERROR("Cannot open file: %s\n", dst_file_name);
+        ret = QZ7Z_ERR_OPEN;
+        goto exit;
+    }
+
+    sheader = generateSignatureHeader();
+    if (!sheader) {
+        QZ_ERROR("Cannot generate signuature header, out of memory");
+        ret = QZ7Z_ERR_OOM;
+        goto exit;
+    }
+
+    src_buffer = malloc(SRC_BUFF_LEN);
+    if (!src_buffer) {
+        QZ_DEBUG("malloc error\n");
+        ret = QZ7Z_ERR_OOM;
+        goto exit;
+    }
+
+    dst_buffer_max_size = qzMaxCompressedLength(SRC_BUFF_LEN, sess);
+    dst_buffer = malloc(dst_buffer_max_size);
+    if (!src_buffer) {
+        QZ_DEBUG("malloc error\n");
+        ret = QZ7Z_ERR_OOM;
+        goto exit;
+    }
+
+    uint64_t sheader_size;
+    ssize_t sheader_written;
+    sheader_wb = generateWriteBuf(500);
+
+    sheader_size = writeSignatureHeaderIoUring(sheader, sheader_wb);
+
+    sqe = io_uring_get_sqe(ring_);
+    CHECK_GET_SQE(sqe)
+    io_uring_prep_write(sqe, dst_file->fd, sheader_wb->buf, sheader_size, dst_file->off);
+    sheader_written = getIoUringResult(ring_);
+    CHECK_IO_URING_WRITE_RETURN(sheader_size, sheader_written, "write signature header")
+    dst_file->off += sheader_written;
+
+    non_empty_number = list->items[1]->total;
+
+    if (non_empty_number) {
+
+        for (int i = 0; i < non_empty_number; ++i) {
+
+            Qz7zFileItem_T *cur_file = qzListGet(list->items[1], i);
+            src_file_name = cur_file->fileName;
+
+            ret = lstat(src_file_name, &src_file_stat);
+            if (ret) {
+                QZ_ERROR("stat(): failed\n");
+                ret = QZ7Z_ERR_STAT;
+                goto exit;
+            }
+
+            if (S_ISBLK(src_file_stat.st_mode)) {
+                if ((src_fd = open(src_file_name, O_RDONLY)) < 0) {
+                    perror(src_file_name);
+                    ret = QZ7Z_ERR_OPEN;
+                    goto exit;
+                } else {
+                    if (ioctl(src_fd, BLKGETSIZE, &src_file_size) < 0) {
+                        close(src_fd);
+                        perror(src_file_name);
+                        ret = QZ7Z_ERR_IOCTL;
+                        goto exit;
+                    }
+                    src_file_size *= 512;
+                    /* size get via BLKGETSIZE is divided by 512 */
+                    close(src_fd);
+                }
+            } else {
+                src_file_size = src_file_stat.st_size;
+            }
+            src_buffer_size = (src_file_size > SRC_BUFF_LEN) ?
+                              SRC_BUFF_LEN : src_file_size;
+            dst_buffer_size = qzMaxCompressedLength(src_buffer_size, sess);
+
+            src_file = generateIoUringFile(src_file_name, O_RDONLY);
+            if (!src_file) {
+                QZ_ERROR("create %s error\n", src_file_name);
+                ret = QZ7Z_ERR_OPEN;
+                goto exit;
+            }
+
+            file_remaining = src_file_size;
+            read_more = 1;
+
+            n_part = src_file_size / SRC_BUFF_LEN;
+            n_part = (src_file_size % SRC_BUFF_LEN) ? n_part + 1 : n_part;
+            is_last = 0;
+            n_part_i = 1;
+
+            do {
+                is_last = (i == non_empty_number - 1) && (n_part_i++ == n_part);
+
+                if (read_more) {
+                    if (cur_file->isSymLink) {
+                        int size;
+                        size = readlink(cur_file->fileName, (char *)src_buffer,
+                                        src_buffer_size);
+                        bytes_read = size;
+                    } else {
+                        ssize_t temp_bytes_read;
+                        sqe = io_uring_get_sqe(ring_);
+                        CHECK_GET_SQE(sqe)
+                        io_uring_prep_read(sqe, src_file->fd, src_buffer, src_buffer_size, src_file->off);
+                        temp_bytes_read = getIoUringResult(ring_);
+                        if(temp_bytes_read <= 0) {
+                            bytes_read = 0;
+                        } else {
+                            bytes_read = temp_bytes_read;
+                        } 
+                        QZ_PRINT("Reading input file %s (%u Bytes)\n",
+                                 src_file_name, bytes_read);
+                        src_file->off += bytes_read;
+                    }
+                } else {
+                    bytes_read = file_remaining;
+                }
+
+                puts("Compressing...");
+
+                ret = doCompressBufferIoUring(sess, src_buffer, &bytes_read,
+                                       dst_buffer, &dst_buffer_size,
+                                       time_list_head, dst_file, &dst_file_size,
+                                       is_last, ring_);
+
+                if (QZ_DATA_ERROR == ret || QZ_BUF_ERROR == ret) {
+                    bytes_processed += bytes_read;
+                    if (0 != bytes_read) {
+                        src_file->off = bytes_processed;
+                        read_more = 1;
+                    } else if (QZ_BUF_ERROR == ret) {
+                        // dest buffer not long enough
+                        if (ratio_limit == ratio_idx) {
+                            QZ_ERROR("Could not expand more destination "
+                                     "buffer\n");
+                            ret = ERROR;
+                            goto exit;
+                        }
+
+                        free(dst_buffer);
+                        dst_buffer_size = src_buffer_size *
+                                          g_bufsz_expansion_ratio[ratio_idx++];
+                        dst_buffer = malloc(dst_buffer_size);
+                        if (NULL == dst_buffer) {
+                            QZ_ERROR("Fail to allocate destination buffer "
+                                     "with size %u\n", dst_buffer_size);
+                            ret = ERROR;
+                            goto exit;
+                        }
+
+                        read_more = 0;
+                    } else {
+                        // corrupt data
+                        ret = ERROR;
+                        goto exit;
+                    }
+                } else if (QZ_OK != ret) {
+                    QZ_ERROR("Process file error: %d\n", ret);
+                    ret = ERROR;
+                    goto exit;
+                } else {
+                    if (cur_file->isSymLink) {
+                        read_more = 0;
+                    } else {
+                        read_more = 1;
+                    }
+                }
+
+                file_remaining -= bytes_read;
+                total_compressed_size = dst_file_size;
+
+            } while (file_remaining > 0);
+
+            destroyIoUringFile(src_file);
+            src_file = NULL;
+        }// end for
+
+    } else {
+        QZ_PRINT("Compressing...\n");
+    }
+
+    eheader = generateEndHeader(list, total_compressed_size);
+    if (!eheader) {
+        QZ_ERROR("cannot allocate for end header\n");
+        ret = QZ7Z_ERR_OOM;
+        goto exit;
+    }
+
+    uint64_t eheader_size;
+    ssize_t eheader_written;
+    uint32_t crc = 0;
+
+    eheader_wb = generateWriteBuf(500);
+
+    eheader_size = writeEndHeaderIoUring(eheader, eheader_wb, &crc);
+    if (eheader_size == 0) {
+        QZ_ERROR("Cannot write 7z end header\n");
+        ret = QZ7Z_ERR_END_HEADER;
+        goto exit;
+    }
+
+    sqe = io_uring_get_sqe(ring_);
+    CHECK_GET_SQE(sqe)
+    io_uring_prep_write(sqe, dst_file->fd, eheader_wb->buf, eheader_size, dst_file->off);
+    eheader_written = getIoUringResult(ring_);
+    CHECK_IO_URING_WRITE_RETURN(eheader_written, eheader_size, "write end header")
+    dst_file->off += eheader_written;
+
+
+    QZ_DEBUG("total compressed: %lu\n"
+             "eheader_size: %lu\n"
+             "crc: %x\n",
+             total_compressed_size, eheader_size, crc);
+
+    uint32_t  start_crc = 0;
+    unsigned char start_header[24];
+
+    memcpy(start_header + SIGNATUREHEADER_OFFSET_NEXTHEADER_OFFSET,
+           &total_compressed_size, sizeof(total_compressed_size));
+    memcpy(start_header + SIGNATUREHEADER_OFFSET_NEXTHEADER_SIZE, &eheader_size,
+           sizeof(eheader_size));
+    memcpy(start_header + SIGNATUREHEADER_OFFSET_NEXTHEADER_CRC, &crc,
+           sizeof(crc));
+    start_crc = crc32(start_crc,
+                      start_header + SIGNATUREHEADER_OFFSET_NEXTHEADER_OFFSET,
+                      20);
+    memcpy(start_header, &start_crc, sizeof(start_crc));
+    dst_file->off = SIGNATUREHEADER_OFFSET_BASE;
+
+    ssize_t start_header_written;
+
+    sqe = io_uring_get_sqe(ring_);
+    CHECK_GET_SQE(sqe)
+    io_uring_prep_write(sqe, dst_file->fd, start_header, sizeof(start_header), dst_file->off);
+    start_header_written = getIoUringResult(ring_);
+    CHECK_IO_URING_WRITE_RETURN(start_header_written, sizeof(start_header), "write start header")
+
+    displayStats(time_list_head, src_file_size, dst_file_size,
+                 1/* is_compress */);
+
+exit:
+    if (eheader) {
+        freeEndHeader(eheader, 1);
+    }
+    if (src_file) {
+        destroyIoUringFile(src_file);
+    }
+    if (dst_buffer) {
+        free(dst_buffer);
+    }
+    if (src_buffer) {
+        free(src_buffer);
+    }
+    if (sheader) {
+        qzFree(sheader);
+    }
+    if (dst_file) {
+        destroyIoUringFile(dst_file);
+    }
+    if (sheader_wb) {
+        destroyWriteBuf(sheader_wb);
+    }
+    if(eheader_wb) {
+        destroyWriteBuf(eheader_wb);
+    }
+
+    freeTimeList(time_list_head);
+    if (!g_keep && OK == ret) {
+        int re = deleteSourceFile(list);
+        if (re != QZ7Z_OK) {
+            QZ_ERROR("deleteSourceFile error: %d\n", re);
+            return re;
+        }
+    }
+
+    return ret;
+}
+
 int qz7zCompress(QzSession_T *sess, Qz7zItemList_T *list,
                  const char *out_name)
 {
     return doCompressFile(sess, list, out_name);
+}
+
+int qz7zCompressIoUring(QzSession_T *sess, Qz7zItemList_T *list,
+                 const char *out_name, struct io_uring *ring_)
+{
+    return doCompressFileIoUring(sess, list, out_name, ring_);
 }
 
 int deleteSourceFile(Qz7zItemList_T *list)
@@ -2109,6 +2561,7 @@ int qz7zDecompress(QzSession_T *sess, const char *archive)
  */
 static int64_t calculateCRC(char *filename, size_t n)
 {
+    clock_t start_crc_time = clock();
     FILE          *fp;
     uint32_t      crc = 0;
     size_t        ret;
@@ -2145,6 +2598,57 @@ static int64_t calculateCRC(char *filename, size_t n)
 
     free(buf);
     fclose(fp);
+    QZ_DEBUG("%s crc: %08x\n", filename, crc);
+    clock_t end_crc_time = clock();
+    double duration = (end_crc_time - start_crc_time)/CLOCKS_PER_SEC;
+    QZ_PRINT("CRC Time: %fs\n", duration);
+    return crc;
+}
+
+static int64_t calculateCRCIoUring(char *filename, size_t n, struct io_uring *ring_)
+{
+    IoUringFile_T          *fp = NULL;
+    uint32_t      crc = 0;
+    ssize_t        ret;
+
+    size_t remaining = n;
+    size_t len;
+
+    struct io_uring_sqe *sqe;
+
+    unsigned char *buf;
+    buf = malloc(SRC_BUFF_LEN);
+    if (!buf) {
+        QZ_ERROR("oom\n");
+        return QZ7Z_ERR_OOM;
+    }
+
+    fp = generateIoUringFile(filename, O_RDONLY);
+    if (!fp) {
+        QZ_ERROR("filename open error\n");
+        free(buf);
+        return QZ7Z_ERR_OPEN;
+    }
+
+    while (remaining > 0) {
+        if (remaining > SRC_BUFF_LEN)
+            len = SRC_BUFF_LEN;
+        else
+            len = remaining;
+
+        sqe = io_uring_get_sqe(ring_);
+        CHECK_GET_SQE(sqe)
+        io_uring_prep_read(sqe, fp->fd, buf, len, fp->off);
+        ret = getIoUringResult(ring_);
+        CHECK_IO_URING_READ_RETURN(ret, len, "crc calculate")
+        fp->off += ret;
+
+        crc = crc32(crc, buf, len);
+        remaining -= len;
+    }
+
+    free(buf);
+    destroyIoUringFile(fp);
     QZ_DEBUG("%s crc: %08x\n", filename, crc);
     return crc;
 }
@@ -2245,6 +2749,50 @@ Qz7zFileItem_T *fileItemCreate(char *f)
             p->size = buf.st_size;
             p->isEmpty = buf.st_size ? 0 : 1;
             p->crc = calculateCRC(p->fileName, p->size);
+        }
+        p->mtime = buf.st_mtime;
+        p->mtime_nano = buf.st_mtim.tv_nsec;
+        p->atime = buf.st_atime;
+        p->atime_nano = buf.st_atim.tv_nsec;
+        //p-7zip use 0x80000 as a unix file flag
+        p->attribute = buf.st_mode << 16 | (0x8000);
+    }
+    return p;
+}
+
+Qz7zFileItem_T *fileItemCreateIoUring(char *f, struct io_uring *ring_)
+{
+    Qz7zFileItem_T *p = malloc(sizeof(Qz7zFileItem_T));
+
+    if (p) {
+        memset(p, 0, sizeof(Qz7zFileItem_T));
+        p->nameLength = strlen(f) + 1;
+        p->fileName = (char *)malloc(p->nameLength);
+        if (!p->fileName) {
+            QZ_ERROR("oom\n");
+            free(p);
+            return NULL;
+        }
+        memset(p->fileName, 0, p->nameLength);
+        strcpy(p->fileName, f);
+    
+        struct stat buf;
+        if (lstat(p->fileName, &buf) < 0) {
+            QZ_ERROR("stat func error\n");
+            free(p->fileName);
+            free(p);
+            return NULL;
+        }
+        if (S_ISLNK(buf.st_mode)) {
+            p->isSymLink = 1;
+            p->crc = calculateSymCRC(p->fileName, buf.st_size);
+            p->size = buf.st_size;
+        } else if (S_ISDIR(buf.st_mode)) {
+            p->isDir = 1;
+        } else {
+            p->size = buf.st_size;
+            p->isEmpty = buf.st_size ? 0 : 1;
+            p->crc = calculateCRCIoUring(p->fileName, p->size, ring_);
         }
         p->mtime = buf.st_mtime;
         p->mtime_nano = buf.st_mtim.tv_nsec;
@@ -2642,6 +3190,55 @@ Qz7zEndHeader_T *generateEndHeader(Qz7zItemList_T *the_list,
     return header;
 }
 
+IoUringFile_T *generateIoUringFile(const char *file_name, int flags) 
+{
+    int fd = open(file_name, flags);
+    if(fd < 0) {
+        return NULL;
+    } 
+
+    IoUringFile_T *io_uring_file = malloc(sizeof(IoUringFile_T));
+    CHECK_ALLOC_RETURN_VALUE(io_uring_file)
+    io_uring_file->fd = fd;
+    io_uring_file->off = 0;
+    return io_uring_file;
+}
+
+IoUringFile_T *generateIoUringFileWithMode(const char *file_name, int flags, mode_t mode) 
+{
+    int fd = open(file_name, flags, mode);
+    if(fd < 0) {
+        return NULL;
+    } 
+
+    IoUringFile_T *io_uring_file = malloc(sizeof(IoUringFile_T));
+    CHECK_ALLOC_RETURN_VALUE(io_uring_file)
+    io_uring_file->fd = fd;
+    io_uring_file->off = 0;
+    return io_uring_file;
+}
+
+WriteBuf_T *generateWriteBuf(int size) {
+    WriteBuf_T *wb = malloc(sizeof(WriteBuf_T));
+    CHECK_ALLOC_RETURN_VALUE(wb)
+    char *buf = malloc(sizeof(char) * size);
+    CHECK_ALLOC_RETURN_VALUE(buf)
+    wb->buf = buf;
+    wb->off = 0;
+    wb->size = size;
+    return wb;
+}
+
+void destroyIoUringFile(IoUringFile_T *fp) {
+    close(fp->fd);
+    free(fp);
+}
+
+void destroyWriteBuf(WriteBuf_T *wb) {
+    free(wb->buf);
+    free(wb);
+}
+
 QzCatagoryTable_T *createCatagoryList()
 {
     QzCatagoryTable_T  *cat_tbl;
@@ -2709,6 +3306,19 @@ int writeSignatureHeader(Qz7zSignatureHeader_T *header, FILE *fp)
     return QZ7Z_OK;
 }
 
+size_t writeSignatureHeaderIoUring(Qz7zSignatureHeader_T *header, WriteBuf_T *wb)
+{
+    size_t total_size = 0;
+    total_size += bufWrite(header->signature, 1, sizeof(header->signature), wb);
+    total_size += bufWrite(&header->majorVersion, 1, sizeof(header->majorVersion), wb);
+    total_size += bufWrite(&header->minorVersion, 1, sizeof(header->minorVersion), wb);
+    total_size += bufWrite(&header->startHeaderCRC, 1, sizeof(header->startHeaderCRC), wb);
+    total_size += bufWrite(&header->nextHeaderOffset, 1, sizeof(header->nextHeaderOffset), wb);
+    total_size += bufWrite(&header->nextHeaderSize, 1, sizeof(header->nextHeaderSize), wb);
+    total_size += bufWrite(&header->nextHeaderCRC, 1, sizeof(header->nextHeaderCRC), wb);
+    return total_size;
+}
+
 /*
  * write property structure to file
  * if crc is not null, return the crc of the bytes that have written
@@ -2730,6 +3340,19 @@ size_t writeArchiveProperties(Qz7zArchiveProperty_T *property, FILE *fp,
     return total_size;
 }
 
+size_t writeArchivePropertiesIoUring(Qz7zArchiveProperty_T *property, WriteBuf_T *wb,
+                              uint32_t *crc) 
+{
+    size_t total_size = 0;
+    total_size += writeTagIoUring(PROPERTY_ID_ARCHIVE_PROPERTIES, wb, crc);
+    total_size += writeNumberIoUring(property->id, wb, crc);
+    total_size += writeNumberIoUring(property->size, wb, crc);
+    total_size += bufWrite(property->data, 1, property->size, wb);
+    *crc = crc32(*crc, property->data, property->size);
+    total_size += writeTagIoUring(PROPERTY_ID_END, wb, crc);
+    return total_size;
+}
+
 size_t writePackInfo(Qz7zPackInfo_T *pack, FILE *fp, uint32_t *crc)
 {
     int i;
@@ -2743,6 +3366,22 @@ size_t writePackInfo(Qz7zPackInfo_T *pack, FILE *fp, uint32_t *crc)
         total_size += writeNumber(pack->PackSize[i], fp, crc);
     }
     total_size += writeTag(PROPERTY_ID_END, fp, crc);
+    return total_size;
+}
+
+size_t writePackInfoIoUring(Qz7zPackInfo_T *pack, WriteBuf_T *wb, uint32_t *crc)
+{
+    int i;
+    size_t total_size = 0;
+
+    total_size += writeTagIoUring(PROPERTY_ID_PACKINFO, wb, crc);
+    total_size += writeNumberIoUring(pack->PackPos, wb, crc);
+    total_size += writeNumberIoUring(pack->NumPackStreams, wb, crc);
+    total_size += writeTagIoUring(PROPERTY_ID_SIZE, wb, crc);
+    for (i = 0; i < pack->NumPackStreams; ++i) {
+        total_size += writeNumberIoUring(pack->PackSize[i], wb, crc);
+    }
+    total_size += writeTagIoUring(PROPERTY_ID_END, wb, crc);
     return total_size;
 }
 
@@ -2760,6 +3399,23 @@ size_t writeFolder(Qz7zFolderInfo_T *folder, FILE *fp, uint32_t *crc)
                       coder->coderFirstByte.st.CodecIdSize, fp);
         CHECK_FWRITE_RETURN(size, coder->coderFirstByte.st.CodecIdSize)
         total_size += size;
+        *crc = crc32(*crc, coder->codecID,
+                     coder->coderFirstByte.st.CodecIdSize);
+    }
+    return total_size;
+}
+
+size_t writeFolderIoUring(Qz7zFolderInfo_T *folder, WriteBuf_T *wb, uint32_t *crc)
+{
+    int i;
+    size_t total_size = 0;
+    Qz7zCoder_T *coder = folder->coder_list;
+
+    total_size += writeNumberIoUring(folder->numCoders, wb, crc);
+    for (i = 0; i < folder->numCoders; ++i) {
+        total_size += writeByteIoUring(coder->coderFirstByte.uc, wb, crc);
+        total_size += bufWrite(coder->codecID, sizeof(unsigned char),
+                      coder->coderFirstByte.st.CodecIdSize, wb);
         *crc = crc32(*crc, coder->codecID,
                      coder->coderFirstByte.st.CodecIdSize);
     }
@@ -2789,6 +3445,29 @@ size_t writeCodersInfo(Qz7zCodersInfo_T *coders, FILE *fp, uint32_t *crc)
     return total_size;
 }
 
+size_t writeCodersInfoIoUring(Qz7zCodersInfo_T *coders, WriteBuf_T *wb, uint32_t *crc)
+{
+    int i;
+    size_t total_size = 0;
+
+    total_size += writeTagIoUring(PROPERTY_ID_UNPACKINFO, wb, crc);
+    total_size += writeTagIoUring(PROPERTY_ID_FOLDER, wb, crc);
+    total_size += writeNumberIoUring(coders->numFolders, wb, crc);
+    total_size += writeByteIoUring(0, wb, crc); // external = 0
+
+    for (i = 0; i < coders->numFolders; ++i) {
+        total_size += writeFolderIoUring(&coders->folders[i], wb, crc);
+    }
+
+    total_size += writeTagIoUring(PROPERTY_ID_CODERS_UNPACK_SIZE, wb, crc);
+    for (i = 0; i < coders->numFolders; ++i) {
+        total_size += writeNumberIoUring(coders->unPackSize[i], wb, crc);
+    }
+
+    total_size += writeTagIoUring(PROPERTY_ID_END, wb, crc);
+    return total_size;
+}
+
 size_t writeDigestInfo(Qz7zDigest_T *digest, FILE *fp, uint32_t *crc)
 {
     int i;
@@ -2800,6 +3479,20 @@ size_t writeDigestInfo(Qz7zDigest_T *digest, FILE *fp, uint32_t *crc)
         size = fwrite(&digest->crc[i], sizeof(digest->crc[i]), 1, fp);
         CHECK_FWRITE_RETURN(size, 1)
         total_size += size * sizeof(digest->crc[i]);
+        *crc = crc32(*crc, (unsigned char *)&digest->crc[i],
+                     sizeof(digest->crc[i]));
+    }
+    return total_size;
+}
+
+size_t writeDigestInfoIoUring(Qz7zDigest_T *digest, WriteBuf_T *wb, uint32_t *crc)
+{
+    int i;
+    size_t total_size = 0;
+    total_size += writeByteIoUring(digest->allAreDefined, wb, crc);
+
+    for (i = 0; i < digest->numStreams; ++i) {
+        total_size += bufWrite(&digest->crc[i], sizeof(digest->crc[i]), 1, wb);
         *crc = crc32(*crc, (unsigned char *)&digest->crc[i],
                      sizeof(digest->crc[i]));
     }
@@ -2839,6 +3532,39 @@ size_t writeSubstreamsInfo(Qz7zSubstreamsInfo_T *substreams, FILE *fp,
     return total_size;
 }
 
+size_t writeSubstreamsInfoIoUring(Qz7zSubstreamsInfo_T *substreams, WriteBuf_T *wb,
+                           uint32_t *crc)
+{
+    int i, j;
+    int total_index = 0;
+    int total_files = 0;
+    size_t total_size = 0;
+
+    if (!substreams) return 0;
+
+    total_size += writeTagIoUring(PROPERTY_ID_SUBSTREAMSINFO, wb, crc);
+    total_size += writeTagIoUring(PROPERTY_ID_NUM_UNPACK_STREAM, wb, crc);
+
+    for (i = 0; i < substreams->numFolders; ++i) {
+        total_files += substreams->numUnPackStreams[i];
+        total_size += writeNumberIoUring(substreams->numUnPackStreams[i], wb, crc);
+    }
+
+    total_size += writeTagIoUring(PROPERTY_ID_SIZE, wb, crc);
+    for (i = 0; i < substreams->numFolders; ++i) {
+        for (j = 0; j < substreams->numUnPackStreams[i] - 1; ++j) {
+            total_size += writeNumberIoUring(substreams->unPackSize[total_index++], wb,
+                                      crc);
+        }
+    }
+
+    total_size += writeTagIoUring(PROPERTY_ID_CRC, wb, crc);
+    total_size += writeDigestInfoIoUring(substreams->digests, wb, crc);
+
+    total_size += writeTagIoUring(PROPERTY_ID_END, wb, crc);
+    return total_size;
+}
+
 size_t writeStreamsInfo(Qz7zStreamsInfo_T *streams, FILE *fp,
                         uint32_t *crc)
 {
@@ -2850,6 +3576,20 @@ size_t writeStreamsInfo(Qz7zStreamsInfo_T *streams, FILE *fp,
     total_size += writeCodersInfo(streams->codersInfo, fp, crc);
     total_size += writeSubstreamsInfo(streams->substreamsInfo, fp, crc);
     total_size += writeTag(PROPERTY_ID_END, fp, crc);
+    return total_size;
+}
+
+size_t writeStreamsInfoIoUring(Qz7zStreamsInfo_T *streams, WriteBuf_T *wb,
+                        uint32_t *crc)
+{
+    size_t total_size = 0;
+    if (!streams) return 0;
+
+    total_size += writeTagIoUring(PROPERTY_ID_MAIN_STREAMSINFO, wb, crc);
+    total_size += writePackInfoIoUring(streams->packInfo, wb, crc);
+    total_size += writeCodersInfoIoUring(streams->codersInfo, wb, crc);
+    total_size += writeSubstreamsInfoIoUring(streams->substreamsInfo, wb, crc);
+    total_size += writeTagIoUring(PROPERTY_ID_END, wb, crc);
     return total_size;
 }
 
@@ -3080,6 +3820,91 @@ size_t writeFilesInfo(Qz7zFilesInfo_T *files, FILE *fp, uint32_t *crc)
     return total_size;
 }
 
+size_t writeFilesInfoIoUring(Qz7zFilesInfo_T *files, WriteBuf_T *wb, uint32_t *crc)
+{
+    int n_emptystream = files->head[0]->total;
+    int n_file = files->head[1]->total;
+    uint64_t size = 0;
+    unsigned char *p;
+    uint64_t total_size = 0;
+    unsigned char *buf;
+    uint32_t *attributes;
+    int has_zerobyte_file = 0;
+
+    total_size += writeTagIoUring(PROPERTY_ID_FILESINFO, wb, crc);
+    total_size += writeNumberIoUring(files->num, wb, crc);
+    total_size += writeTagIoUring(PROPERTY_ID_EMPTY_STREAM, wb, crc);
+    p = calculateEmptyStreamProperty(n_emptystream, n_file, &size);
+    total_size += writeNumberIoUring(size, wb, crc);
+    total_size += bufWrite(p, 1, size, wb);
+    *crc = crc32(*crc, p, size);
+    free(p);
+    p = NULL;
+    has_zerobyte_file =  checkZerobyteFiles(files);
+
+    if (n_emptystream && has_zerobyte_file) {
+        total_size += writeTagIoUring(PROPERTY_ID_EMPTY_FILE, wb, crc);
+        p = calculateEmptyFileProperty(files, n_emptystream, &size);
+        if (!p) {
+            QZ_ERROR("Cannot calculate emptyfile property\n");
+            exit(ERROR);
+        }
+        total_size += writeNumberIoUring(size, wb, crc);
+        total_size += bufWrite(p, 1, size, wb);
+        *crc = crc32(*crc, p, size);
+        free(p);
+        p = NULL;
+    }
+
+    total_size += writeTagIoUring(PROPERTY_ID_DUMMY, wb, crc);
+    total_size += writeNumberIoUring(2, wb, crc);
+    total_size += writeByteIoUring(PROPERTY_CONTENT_DUMMY, wb, crc);
+    total_size += writeByteIoUring(PROPERTY_CONTENT_DUMMY, wb, crc);
+
+    total_size += writeTagIoUring(PROPERTY_ID_NAME, wb, crc);
+    buf = genNamesPart(files->head[0], files->head[1], &size);
+    total_size += writeNumberIoUring(size, wb, crc);
+    total_size += bufWrite(buf, 1, size, wb);
+    *crc = crc32(*crc, buf, size);
+    free(buf);
+
+    int i;
+    Qz7zFileItem_T *pfile;
+    FILETIME_T win_time;
+    total_size += writeTagIoUring(PROPERTY_ID_MTIME, wb, crc);
+    total_size += writeNumberIoUring((n_emptystream + n_file) * 8 + 2, wb, crc);
+    total_size += writeTagIoUring(1, wb, crc);
+    total_size += writeTagIoUring(0, wb, crc);
+
+    for (i = 0; i < n_emptystream; ++i) {
+        pfile = (Qz7zFileItem_T *)qzListGet(files->head[0], i);
+        win_time = unixtimeToFiletime(pfile->mtime, pfile->mtime_nano);
+        total_size += writeTimeIoUring(win_time.low, wb, crc);
+        total_size += writeTimeIoUring(win_time.high, wb, crc);
+    }
+
+    for (i = 0; i < n_file; ++i) {
+        pfile = (Qz7zFileItem_T *)qzListGet(files->head[1], i);
+        win_time = unixtimeToFiletime(pfile->mtime, pfile->mtime_nano);
+        total_size += writeTimeIoUring(win_time.low, wb, crc);
+        total_size += writeTimeIoUring(win_time.high, wb, crc);
+    }
+
+    total_size += writeTagIoUring(PROPERTY_ID_ATTRIBUTES, wb, crc);
+    attributes = genAttributes(files->head[0], files->head[1]);
+    size = 2 + 4 * (n_emptystream + n_file);
+    total_size += writeNumberIoUring(size, wb, crc);
+    total_size += writeByteIoUring(FLAG_ATTR_DEFINED_SET, wb, crc);
+    total_size += writeByteIoUring(FLAG_ATTR_EXTERNAL_UNSET, wb, crc);
+    for (i = 0; i < n_emptystream + n_file; ++i) {
+        total_size += writeTimeIoUring(attributes[i], wb, crc);
+    }
+    free(attributes);
+
+    total_size += writeTagIoUring(PROPERTY_ID_END, wb, crc);
+    return total_size;
+}
+
 /**
  * return total size that has written
  */
@@ -3095,6 +3920,21 @@ size_t writeEndHeader(Qz7zEndHeader_T *header, FILE *fp, uint32_t *crc)
     total_size += writeStreamsInfo(header->streamsInfo, fp, crc);
     total_size += writeFilesInfo(header->filesInfo, fp, crc);
     total_size += writeTag(PROPERTY_ID_END, fp, crc);
+    return total_size;
+}
+
+size_t writeEndHeaderIoUring(Qz7zEndHeader_T *header, WriteBuf_T *wb, uint32_t *crc)
+{
+    size_t total_size = 0;
+    if (!crc) {
+        QZ_ERROR("bad crc param\n");
+        return 0;
+    }
+    total_size += writeTagIoUring(PROPERTY_ID_HEADER, wb, crc);
+    total_size += writeArchivePropertiesIoUring(header->propertyInfo, wb, crc);
+    total_size += writeStreamsInfoIoUring(header->streamsInfo, wb, crc);
+    total_size += writeFilesInfoIoUring(header->filesInfo, wb, crc);
+    total_size += writeTagIoUring(PROPERTY_ID_END, wb, crc);
     return total_size;
 }
 
@@ -3118,7 +3958,6 @@ Qz7zItemList_T *itemListCreate(int n, char **files)
     QZ_DEBUG("dirs_head : %p\n", (void *)dirs_head);
     QzListHead_T *files_head = res->items[1];
     QZ_DEBUG("files_head : %p\n", (void *)files_head);
-
     for (i = 0; i < n; ++i) {
 #ifdef QZ7Z_DEBUG
         QZ_DEBUG("process %dth parameter: %s\n", i + 1, files[optind]);
@@ -3186,7 +4025,108 @@ Qz7zItemList_T *itemListCreate(int n, char **files)
     /* now the res->items has been resolved successfully */
     res->table = createCatagoryList();
     scanFilesIntoCatagory(res);
+    return res;
 
+error:
+    if (dirp) {
+        closedir(dirp);
+    }
+    if (fi) {
+        free(fi);
+    }
+    if (res) {
+        itemListDestroy(res);
+    }
+    return NULL;
+}
+
+Qz7zItemList_T *itemListCreateIoUring(int n, char **files, struct io_uring *ring_)
+{
+    int      i;
+    uint32_t dir_index = 0;
+    // the index of next processing directory in the dir list
+    Qz7zFileItem_T *fi = NULL;
+    DIR *dirp = NULL;
+    Qz7zItemList_T *res = malloc(sizeof(Qz7zItemList_T));
+    if (!res) {
+        QZ_ERROR("malloc error\n");
+        return NULL;
+    }
+
+    res->items[0] = qzListCreate(QZ_DIRLIST_DEFAULT_NUM_PER_NODE);
+    res->items[1] = qzListCreate(QZ_FILELIST_DEFAULT_NUM_PER_NODE);
+
+    QzListHead_T *dirs_head = res->items[0];
+    QZ_DEBUG("dirs_head : %p\n", (void *)dirs_head);
+    QzListHead_T *files_head = res->items[1];
+    QZ_DEBUG("files_head : %p\n", (void *)files_head);
+    for (i = 0; i < n; ++i) {
+#ifdef QZ7Z_DEBUG
+        QZ_DEBUG("process %dth parameter: %s\n", i + 1, files[optind]);
+#endif
+
+        fi = fileItemCreateIoUring(files[optind], ring_);
+        if (!fi) {
+            QZ_ERROR("Cannot create file\n");
+            goto error;
+        }
+
+        if (fi->isDir || fi->isEmpty) {
+            qzListAdd(dirs_head, (void **)&fi);  // add it to directory list
+
+            while (dir_index < dirs_head->total) {
+                Qz7zFileItem_T  *processing =
+                    (Qz7zFileItem_T *)qzListGet(dirs_head, dir_index);
+
+                if (processing == NULL) {
+                    QZ_DEBUG("qzListGet got NULL!\n");
+                    goto error;
+                }
+                QZ_DEBUG("processing: %s\n", processing->fileName);
+
+                if (processing->isDir) {
+                    struct dirent *dentry;
+                    dirp = opendir(processing->fileName);
+                    if (!dirp) {
+                        QZ_ERROR("errors ocurs: %s \n", strerror(errno));
+                        goto error;
+                    }
+
+                    while ((dentry = readdir(dirp))) {
+                        char file_path[PATH_MAX + 1];
+                        memset(file_path, 0, PATH_MAX + 1);
+
+                        if (!strcmp(dentry->d_name, ".")) continue;
+                        if (!strcmp(dentry->d_name, "..")) continue;
+
+                        snprintf(file_path, sizeof file_path, "%s/%s",
+                                 processing->fileName, dentry->d_name);
+                        QZ_DEBUG(" file_path: %s\n", file_path);
+                        Qz7zFileItem_T *anotherfile =
+                            fileItemCreate(file_path);
+                        if (!anotherfile) {
+                            QZ_ERROR("Cannot create file\n");
+                            goto error;
+                        }
+
+                        if (anotherfile->isDir || anotherfile->isEmpty) {
+                            qzListAdd(dirs_head, (void **)&anotherfile);
+                        } else {
+                            qzListAdd(files_head, (void **)&anotherfile);
+                        }
+                    }
+                }
+                dir_index++;
+            }
+        } else {
+            qzListAdd(files_head, (void **)&fi);
+        }
+        optind++;
+    }// end for
+
+    /* now the res->items has been resolved successfully */
+    res->table = createCatagoryList();
+    scanFilesIntoCatagory(res);
     return res;
 
 error:

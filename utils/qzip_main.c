@@ -170,6 +170,13 @@ int main(int argc, char **argv)
     if (qatzipSetup(&g_sess, &g_params_th)) {
         exit(ERROR);
     }
+
+    const int init_io_uring_res = io_uring_queue_init(256, &ring, 0);
+    if(init_io_uring_res != 0) {
+        QZ_ERROR("Init Io_Uring failed\n");
+        exit(init_io_uring_res);
+    }
+
     if (0 == arg_count) {
         if (isatty(fileno((FILE *)stdout)) && 0 == option_f &&
             0 == g_decompress) {
@@ -201,7 +208,6 @@ int main(int argc, char **argv)
                 exit(ERROR);
             }
         }
-
         the_list = itemListCreate(arg_count, argv);
         if (!the_list) {
             exit(ERROR);
@@ -273,6 +279,8 @@ int main(int argc, char **argv)
     if (qatzipClose(&g_sess)) {
         exit(ERROR);
     }
+
+    io_uring_queue_exit(&ring);
 
     return ret;
 }

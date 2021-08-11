@@ -59,6 +59,7 @@
 #include <qatzip_internal.h>
 #include <zlib.h>
 #include <libgen.h>
+#include <liburing.h>
 
 /* field offset in signature header */
 #define SIGNATUREHEADER_OFFSET_BASE                  8
@@ -180,6 +181,12 @@ typedef enum QzSuffix_E {
         exit(-QZ7Z_ERR_OOM);\
     }
 
+#define CHECK_GET_SQE(p) \
+    if(NULL == p) {\
+        printf("can't get sqe\n"); \
+        exit(-QZ7Z_ERR_OOM); \
+    }
+
 /* check fread return */
 #define CHECK_FREAD_RETURN(ret, n) if((ret) != (n)) { \
     if (feof(fp)) { \
@@ -189,6 +196,11 @@ typedef enum QzSuffix_E {
             fprintf(stderr, "fread errors.\n"); \
             exit(-QZ7Z_ERR_READ_LESS); \
         } \
+    }
+
+#define CHECK_IO_URING_READ_RETURN(ret, n, log) if((ret) != (n)) { \
+        fprintf(stderr, "Io_Uring read errors. %s\n", log); \
+        exit(-QZ7Z_ERR_WRITE_LESS); \
     }
 
 /* check fwrite return */
@@ -201,6 +213,11 @@ typedef enum QzSuffix_E {
             fprintf(stderr, "fwrite errors.\n"); \
             exit(-QZ7Z_ERR_WRITE_LESS); \
         } \
+    }
+
+#define CHECK_IO_URING_WRITE_RETURN(ret, n, log) if((ret) != (n)) { \
+        fprintf(stderr, "Io_Uring write errors. %s\n", log); \
+        exit(-QZ7Z_ERR_WRITE_LESS); \
     }
 
 typedef struct RunTimeList_S {
@@ -572,6 +589,17 @@ typedef struct Qz7zItemList_S {
     QzCatagoryTable_T  *table;
 } Qz7zItemList_T;
 
+typedef struct IoUringFile_S {
+    int fd;
+    off_t off;
+} IoUringFile_T;
+
+typedef struct WriteBuf_S {
+    char *buf;
+    off_t off;
+    int size;
+} WriteBuf_T;
+
 /* create a list return list head */
 QzListHead_T *qzListCreate(int num_per_node);
 
@@ -586,12 +614,14 @@ void qzListDestroy(QzListHead_T *head);
 
 /* create the file items list */
 Qz7zFileItem_T *fileItemCreate(char *pfilename);
+Qz7zFileItem_T *fileItemCreateIoUring(char *f, struct io_uring *ring_);
 
 /* destroy the items list */
 void itemListDestroy(Qz7zItemList_T *p);
 
 /* process the cmdline inputs */
 Qz7zItemList_T *itemListCreate(int n, char **files);
+Qz7zItemList_T *itemListCreateIoUring(int n, char **files, struct io_uring *ring_);
 
 
 /*
@@ -623,13 +653,21 @@ Qz7zSubstreamsInfo_T *generateSubstreamsInfo(Qz7zItemList_T *the_list);
 Qz7zFilesInfo_T *generateFilesInfo(Qz7zItemList_T *the_list);
 Qz7zEndHeader_T *generateEndHeader(Qz7zItemList_T *the_list,
                                    size_t compressed_size);
+IoUringFile_T *generateIoUringFile(const char *file_name, int flags);
+IoUringFile_T *generateIoUringFileWithMode(const char *file_name, int flags, mode_t mode);
+WriteBuf_T *generateWriteBuf(int size);
+
+void destroyIoUringFile(IoUringFile_T *fp);
+void destroyWriteBuf(WriteBuf_T *wb);
 
 /*
  * write function
  */
 int writeSignatureHeader(Qz7zSignatureHeader_T *header, FILE *fp);
+
 size_t writeArchiveProperties(Qz7zArchiveProperty_T *property, FILE *fp,
                               uint32_t *crc);
+
 size_t writePackInfo(Qz7zPackInfo_T *pack, FILE *fp, uint32_t *crc);
 size_t writeFolder(Qz7zFolderInfo_T *folder, FILE *fp, uint32_t *crc);
 size_t writeCodersInfo(Qz7zCodersInfo_T *coders, FILE *fp, uint32_t *crc);
@@ -639,6 +677,24 @@ size_t writeFilesInfo(Qz7zFilesInfo_T *files, FILE *fp, uint32_t *crc);
 size_t writeSubstreamsInfo(Qz7zSubstreamsInfo_T *substreams, FILE *fp,
                            uint32_t *crc);
 size_t writeEndHeader(Qz7zEndHeader_T *header, FILE *fp, uint32_t *crc);
+
+/*
+ * Buf write function
+ */
+size_t writeSignatureHeaderIoUring(Qz7zSignatureHeader_T *header, WriteBuf_T *wb);
+
+size_t writeArchivePropertiesIoUring(Qz7zArchiveProperty_T *property, WriteBuf_T *wb,
+                              uint32_t *crc);
+
+size_t writePackInfoIoUring(Qz7zPackInfo_T *pack, WriteBuf_T *wb, uint32_t *crc);
+size_t writeFolderIoUring(Qz7zFolderInfo_T *folder, WriteBuf_T *wb, uint32_t *crc);
+size_t writeCodersInfoIoUring(Qz7zCodersInfo_T *coders, WriteBuf_T *wb, uint32_t *crc);
+size_t writeDigestInfoIoUring(Qz7zDigest_T *digest, WriteBuf_T *wb, uint32_t *crc);
+size_t writeStreamsInfoIoUring(Qz7zStreamsInfo_T *streams, WriteBuf_T *wb, uint32_t *crc);
+size_t writeFilesInfoIoUring(Qz7zFilesInfo_T *files, WriteBuf_T *wb, uint32_t *crc);
+size_t writeSubstreamsInfoIoUring(Qz7zSubstreamsInfo_T *substreams, WriteBuf_T *wb,
+                           uint32_t *crc);
+size_t writeEndHeaderIoUring(Qz7zEndHeader_T *header, WriteBuf_T *wb, uint32_t *crc);
 
 /*
  * free functions
@@ -656,6 +712,8 @@ void freeEndHeader(Qz7zEndHeader_T *eheader, int is_compress);
 /* the main API for compress into 7z format */
 int qz7zCompress(QzSession_T *sess, Qz7zItemList_T *the_list,
                  const char *out_name);
+int qz7zCompressIoUring(QzSession_T *sess, Qz7zItemList_T *the_list,
+                 const char *out_name, struct io_uring *ring_);
 
 /* the main API for decompress a 7z file */
 int qz7zDecompress(QzSession_T *sess, const char *archive);
@@ -734,6 +792,8 @@ void processStream(QzSession_T *sess, FILE *src_file, FILE *dst_file,
 
 int doCompressFile(QzSession_T *sess, Qz7zItemList_T *list,
                    const char *dst_file_name);
+int doCompressFileIoUring(QzSession_T *sess, Qz7zItemList_T *list,
+                   const char *dst_file_name, struct io_uring *ring_);
 
 int doDecompressFile(QzSession_T *sess, const char *src_file_name);
 
@@ -753,5 +813,6 @@ extern char const g_short_opts[];
 extern const struct option g_long_opts[];
 extern const unsigned int USDM_ALLOC_MAX_SZ;
 extern int errno;
+extern struct io_uring ring;
 
 #endif

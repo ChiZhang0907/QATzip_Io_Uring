@@ -33,6 +33,7 @@
 ################################################################
 
 LIB_STATIC += $(QATZIP_LIB_D)/$(QATZIP_LIB_STATIC)
+LIBADD += -luring
 
 all: qzip
 

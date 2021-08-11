@@ -44,6 +44,7 @@ int g_decompress = 0;        /* g_decompress (-d) */
 int g_keep = 0;                     /* keep (don't delete) input files */
 QzSession_T g_sess;
 QzSessionParams_T g_params_th = {(QzHuffmanHdr_T)0,};
+struct io_uring ring;
 
 /* Estimate maximum data expansion after decompression */
 const unsigned int g_bufsz_expansion_ratio[] = {5, 20, 50, 100};
