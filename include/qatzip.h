@@ -375,7 +375,7 @@ typedef struct QzSessionParams_S {
 #define QZ_COMP_ALGOL_DEFAULT        QZ_DEFLATE
 #define QZ_POLL_SLEEP_DEFAULT        10
 #define QZ_MAX_FORK_DEFAULT          3
-#define QZ_SW_BACKUP_DEFAULT         1
+#define QZ_SW_BACKUP_DEFAULT         0
 #define QZ_HW_BUFF_SZ                (64*1024)
 #define QZ_HW_BUFF_MIN_SZ            (1*1024)
 #define QZ_HW_BUFF_MAX_SZ            (512*1024)

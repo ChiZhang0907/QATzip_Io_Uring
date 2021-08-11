@@ -59,6 +59,7 @@
 #include <qatzip_internal.h>
 #include <zlib.h>
 #include <libgen.h>
+#include <liburing.h>
 
 /* field offset in signature header */
 #define SIGNATUREHEADER_OFFSET_BASE                  8
@@ -180,6 +181,13 @@ typedef enum QzSuffix_E {
         exit(-QZ7Z_ERR_OOM);\
     }
 
+/* check sqe pointer */
+#define CHECK_GET_SQE(p) \
+    if(NULL == p) {\
+        printf("can't get sqe\n"); \
+        exit(-QZ7Z_ERR_OOM);\
+    }
+
 /* check fread return */
 #define CHECK_FREAD_RETURN(ret, n) if((ret) != (n)) { \
     if (feof(fp)) { \
@@ -201,6 +209,11 @@ typedef enum QzSuffix_E {
             fprintf(stderr, "fwrite errors.\n"); \
             exit(-QZ7Z_ERR_WRITE_LESS); \
         } \
+    }
+
+#define CHECK_IO_URING_WRITE_RETURN(ret, n, log) if((ret) != n) { \
+        fprintf(stderr, "Io_Uring write error %s\n", log); \
+        exit(-QZ7Z_ERR_WRITE_LESS); \
     }
 
 typedef struct RunTimeList_S {
@@ -572,6 +585,11 @@ typedef struct Qz7zItemList_S {
     QzCatagoryTable_T  *table;
 } Qz7zItemList_T;
 
+typedef struct IoUringFile_S {
+    int fd;
+    off_t off;
+} IoUringFile_T;
+ 
 /* create a list return list head */
 QzListHead_T *qzListCreate(int num_per_node);
 
@@ -623,6 +641,8 @@ Qz7zSubstreamsInfo_T *generateSubstreamsInfo(Qz7zItemList_T *the_list);
 Qz7zFilesInfo_T *generateFilesInfo(Qz7zItemList_T *the_list);
 Qz7zEndHeader_T *generateEndHeader(Qz7zItemList_T *the_list,
                                    size_t compressed_size);
+IoUringFile_T *generateIoUringFile(const char *file_name, int flags);
+IoUringFile_T *generateIoUringFileWithMode(const char *file_name, int flags, mode_t mode);
 
 /*
  * write function
@@ -651,6 +671,7 @@ void freeStreamsInfo(Qz7zStreamsInfo_T *info);
 void freeFilesInfo(Qz7zFilesInfo_T *info);
 void freeFilesDecInfo(Qz7zFilesInfo_Dec_T *info);
 void freeEndHeader(Qz7zEndHeader_T *eheader, int is_compress);
+void freeIoUringFile(IoUringFile_T *iouringf);
 
 
 /* the main API for compress into 7z format */
@@ -716,15 +737,24 @@ int qatzipClose(QzSession_T *sess);
 
 void processFile(QzSession_T *sess, const char *in_name,
                  const char *out_name, int is_compress);
+void processFileIoUring(QzSession_T *sess, const char *in_name,
+                 const char *out_name, int is_compress, struct io_uring *ring_);
 
 int doProcessBuffer(QzSession_T *sess,
                     unsigned char *src, unsigned int *src_len,
                     unsigned char *dst, unsigned int dst_len,
                     RunTimeList_T *time_list, FILE *dst_file,
                     off_t *dst_file_size, int is_compress);
+int doProcessBufferIoUring(QzSession_T *sess,
+                    unsigned char *src, unsigned int *src_len,
+                    unsigned char *dst, unsigned int dst_len,
+                    RunTimeList_T *time_list, IoUringFile_T *dst_file,
+                    off_t *dst_file_size, int is_compress, struct io_uring *ring_);
 
 void doProcessFile(QzSession_T *sess, const char *src_file_name,
                    const char *dst_file_name, int is_compress);
+void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
+                   const char *dst_file_name, int is_compress, struct io_uring *ring_);
 
 void processDir(QzSession_T *sess, const char *in_name,
                 const char *out_name, int is_compress);
@@ -737,6 +767,12 @@ int doCompressFile(QzSession_T *sess, Qz7zItemList_T *list,
 
 int doDecompressFile(QzSession_T *sess, const char *src_file_name);
 
+
+/*
+ * io_uring api
+ */
+ssize_t getIoUringResult(struct io_uring *ring_);
+
 /*
  * extern declaration
  */
@@ -744,6 +780,7 @@ extern char const *const g_license_msg[2];
 extern char *g_program_name;
 extern int g_decompress;        /* g_decompress (-d) */
 extern int g_keep;                     /* keep (don't delete) input files */
+extern int g_io_uring;
 extern QzSession_T g_sess;
 extern QzSessionParams_T g_params_th;
 /* Estimate maximum data expansion after decompression */
@@ -753,5 +790,6 @@ extern char const g_short_opts[];
 extern const struct option g_long_opts[];
 extern const unsigned int USDM_ALLOC_MAX_SZ;
 extern int errno;
+extern struct io_uring ring;
 
 #endif

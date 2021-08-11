@@ -42,14 +42,16 @@ char const *const g_license_msg[] = {
 char *g_program_name = NULL; /* program name */
 int g_decompress = 0;        /* g_decompress (-d) */
 int g_keep = 0;                     /* keep (don't delete) input files */
+int g_io_uring = 1;
 QzSession_T g_sess;
 QzSessionParams_T g_params_th = {(QzHuffmanHdr_T)0,};
+struct io_uring ring;
 
 /* Estimate maximum data expansion after decompression */
 const unsigned int g_bufsz_expansion_ratio[] = {5, 20, 50, 100};
 
 /* Command line options*/
-char const g_short_opts[] = "A:H:L:C:r:o:O:P:dfhkVR";
+char const g_short_opts[] = "A:H:L:C:r:o:O:P:dfhkVRi";
 const struct option g_long_opts[] = {
     /* { name  has_arg  *flag  val } */
     {"decompress", 0, 0, 'd'}, /* decompress */
@@ -57,6 +59,7 @@ const struct option g_long_opts[] = {
     {"force",      0, 0, 'f'}, /* force overwrite of output file */
     {"help",       0, 0, 'h'}, /* give help */
     {"keep",       0, 0, 'k'}, /* keep (don't delete) input files */
+    {"io_uring",   0, 0, 'i'}, /* don't use io_uring to read and write files */
     {"version",    0, 0, 'V'}, /* display version number */
     {"algorithm",  1, 0, 'A'}, /* set algorithm type */
     {"huffmanhdr", 1, 0, 'H'}, /* set huffman header type */
@@ -93,6 +96,7 @@ void help(void)
         "  -h, --help        give this help",
         "  -H, --huffmanhdr  set huffman header type",
         "  -k, --keep        keep (don't delete) input files",
+        "  -i, --io_uring    don't use io_uring to read and write files",
         "  -V, --version     display version number",
         "  -L, --level       set compression level",
         "  -C, --chunksz     set chunk size",
@@ -214,6 +218,85 @@ int doProcessBuffer(QzSession_T *sess,
         bytes_written = fwrite(dst, 1, dst_len, dst_file);
         assert(bytes_written == dst_len);
         *dst_file_size += bytes_written;
+
+        buf_processed += *src_len;
+        buf_remaining -= *src_len;
+        if (0 == buf_remaining) {
+            done = 1;
+        }
+        src += *src_len;
+        QZ_DEBUG("src_len is %u ,buf_remaining is %u\n", *src_len,
+                 buf_remaining);
+        *src_len = buf_remaining;
+        dst_len = valid_dst_buf_len;
+        bytes_written = 0;
+    }
+
+    *src_len = buf_processed;
+    return ret;
+}
+
+int doProcessBufferIoUring(QzSession_T *sess,
+                    unsigned char *src, unsigned int *src_len,
+                    unsigned char *dst, unsigned int dst_len,
+                    RunTimeList_T *time_list, IoUringFile_T *dst_file,
+                    off_t *dst_file_size, int is_compress, struct io_uring *ring_)
+{
+    int ret = QZ_FAIL;
+    unsigned int done = 0;
+    unsigned int buf_processed = 0;
+    unsigned int buf_remaining = *src_len;
+    ssize_t bytes_written = 0;
+    unsigned int valid_dst_buf_len = dst_len;
+    RunTimeList_T *time_node = time_list;
+    struct io_uring_sqe *sqe = NULL;
+
+
+    while (time_node->next) {
+        time_node = time_node->next;
+    }
+
+    while (!done) {
+        RunTimeList_T *run_time = calloc(1, sizeof(RunTimeList_T));
+        assert(NULL != run_time);
+        run_time->next = NULL;
+        time_node->next = run_time;
+        time_node = run_time;
+
+        gettimeofday(&run_time->time_s, NULL);
+
+        /* Do actual work */
+        if (is_compress) {
+            ret = qzCompress(sess, src, src_len, dst, &dst_len, 1);
+            if (QZ_BUF_ERROR == ret && 0 == *src_len) {
+                done = 1;
+            }
+        } else {
+            ret = qzDecompress(sess, src, src_len, dst, &dst_len);
+
+            if (QZ_DATA_ERROR == ret ||
+                (QZ_BUF_ERROR == ret && 0 == *src_len)) {
+                done = 1;
+            }
+        }
+
+        if (ret != QZ_OK &&
+            ret != QZ_BUF_ERROR &&
+            ret != QZ_DATA_ERROR) {
+            const char *op = (is_compress) ? "Compression" : "Decompression";
+            QZ_ERROR("doProcessBuffer:%s failed with error: %d\n", op, ret);
+            break;
+        }
+
+        gettimeofday(&run_time->time_e, NULL);
+
+        sqe = io_uring_get_sqe(ring_);
+        CHECK_GET_SQE(sqe)
+        io_uring_prep_write(sqe, dst_file->fd, dst, dst_len, dst_file->off);
+        bytes_written = getIoUringResult(ring_);
+        CHECK_IO_URING_WRITE_RETURN(bytes_written, dst_len, "compress")
+        *dst_file_size += bytes_written;
+        dst_file->off += bytes_written;
 
         buf_processed += *src_len;
         buf_remaining -= *src_len;
@@ -379,6 +462,173 @@ exit:
     }
 }
 
+void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
+                   const char *dst_file_name, int is_compress, struct io_uring *ring_)
+{
+    int ret = OK;
+    struct stat src_file_stat;
+    unsigned int src_buffer_size = 0;
+    unsigned int dst_buffer_size = 0;
+    off_t src_file_size = 0, dst_file_size = 0, file_remaining = 0;
+    unsigned char *src_buffer = NULL;
+    unsigned char *dst_buffer = NULL;
+    IoUringFile_T *src_file = NULL;
+    IoUringFile_T *dst_file = NULL;
+    struct io_uring_sqe *sqe = NULL;
+    unsigned int bytes_read = 0;
+    unsigned long bytes_processed = 0;
+    unsigned int ratio_idx = 0;
+    const unsigned int ratio_limit =
+        sizeof(g_bufsz_expansion_ratio) / sizeof(unsigned int);
+    unsigned int read_more = 0;
+    int src_fd = 0;
+    RunTimeList_T *time_list_head = malloc(sizeof(RunTimeList_T));
+    assert(NULL != time_list_head);
+    gettimeofday(&time_list_head->time_s, NULL);
+    time_list_head->time_e = time_list_head->time_s;
+    time_list_head->next = NULL;
+
+    ret = stat(src_file_name, &src_file_stat);
+    if (ret) {
+        perror(src_file_name);
+        exit(ERROR);
+    }
+
+    if (S_ISBLK(src_file_stat.st_mode)) {
+        if ((src_fd = open(src_file_name, O_RDONLY)) < 0) {
+            perror(src_file_name);
+            exit(ERROR);
+        } else {
+            if (ioctl(src_fd, BLKGETSIZE, &src_file_size) < 0) {
+                close(src_fd);
+                perror(src_file_name);
+                exit(ERROR);
+            }
+            src_file_size *= 512;
+            /* size get via BLKGETSIZE is divided by 512 */
+            close(src_fd);
+        }
+    } else {
+        src_file_size = src_file_stat.st_size;
+    }
+    src_buffer_size = (src_file_size > SRC_BUFF_LEN) ?
+                      SRC_BUFF_LEN : src_file_size;
+    if (is_compress) {
+        dst_buffer_size = qzMaxCompressedLength(src_buffer_size, sess);
+    } else { /* decompress */
+        dst_buffer_size = src_buffer_size *
+                          g_bufsz_expansion_ratio[ratio_idx++];
+    }
+
+    if (0 == src_file_size && is_compress) {
+        dst_buffer_size = 1024;
+    }
+
+    src_buffer = malloc(src_buffer_size);
+    assert(src_buffer != NULL);
+    dst_buffer = malloc(dst_buffer_size);
+    assert(dst_buffer != NULL);
+    src_file = generateIoUringFile(src_file_name, O_RDONLY);
+    if(!src_file) {
+        QZ_ERROR("Cannot open file: %s\n", src_file_name);
+        ret = QZ7Z_ERR_OPEN;
+        goto exit;
+    }
+    dst_file = generateIoUringFileWithMode(dst_file_name, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+    if(!dst_file) {
+        QZ_ERROR("Cannot open file: %s\n", dst_file_name);
+        ret = QZ7Z_ERR_OPEN;
+        goto exit;
+    }
+
+    file_remaining = src_file_size;
+    read_more = 1;
+    do {
+        if (read_more) {
+            ssize_t bytes_read_temp = 0;
+            sqe = io_uring_get_sqe(ring_);
+            CHECK_GET_SQE(sqe)
+            io_uring_prep_read(sqe, src_file->fd, src_buffer, src_buffer_size, src_file->off);
+            bytes_read_temp = getIoUringResult(ring_);
+            if(bytes_read_temp <= 0) {
+                bytes_read = 0;
+            } else {
+                bytes_read = bytes_read_temp;
+            }
+            QZ_PRINT("Reading input file %s (%u Bytes)\n", src_file_name,
+                     bytes_read);
+            src_file->off += bytes_read;
+        } else {
+            bytes_read = file_remaining;
+        }
+
+        puts((is_compress) ? "Compressing..." : "Decompressing...");
+
+        ret = doProcessBufferIoUring(sess, src_buffer, &bytes_read, dst_buffer,
+                              dst_buffer_size, time_list_head, dst_file,
+                              &dst_file_size, is_compress, ring_);
+
+        if (QZ_DATA_ERROR == ret || QZ_BUF_ERROR == ret) {
+            bytes_processed += bytes_read;
+            if (0 != bytes_read) {
+                src_file->off = bytes_processed;
+                read_more = 1;
+            } else if (QZ_BUF_ERROR == ret) {
+                //dest buffer not long enough
+                if (ratio_limit == ratio_idx) {
+                    QZ_ERROR("Could not expand more destination buffer\n");
+                    ret = ERROR;
+                    goto exit;
+                }
+
+                free(dst_buffer);
+                dst_buffer_size = src_buffer_size *
+                                  g_bufsz_expansion_ratio[ratio_idx++];
+                dst_buffer = malloc(dst_buffer_size);
+                if (NULL == dst_buffer) {
+                    QZ_ERROR("Fail to allocate destination buffer with size "
+                             "%u\n", dst_buffer_size);
+                    ret = ERROR;
+                    goto exit;
+                }
+
+                read_more = 0;
+            } else {
+                // corrupt data
+                ret = ERROR;
+                goto exit;
+            }
+        } else if (QZ_OK != ret) {
+            QZ_ERROR("Process file error: %d\n", ret);
+            ret = ERROR;
+            goto exit;
+        } else {
+            read_more = 1;
+        }
+
+        file_remaining -= bytes_read;
+    } while (file_remaining > 0);
+
+    displayStats(time_list_head, src_file_size, dst_file_size, is_compress);
+
+exit:
+    freeTimeList(time_list_head);
+    if(!src_file) {
+        freeIoUringFile(src_file);
+    }
+    if(!dst_file) {
+        freeIoUringFile(dst_file);
+    }
+    free(src_buffer);
+    free(dst_buffer);
+    if (!g_keep && OK == ret) {
+        unlink(src_file_name);
+    }
+    if (ret) {
+        exit(ret);
+    }
+}
+
 int qatzipSetup(QzSession_T *sess, QzSessionParams_T *params)
 {
     int status;
@@ -526,6 +776,31 @@ void processFile(QzSession_T *sess, const char *in_name,
     }
 }
 
+void processFileIoUring(QzSession_T *sess, const char *in_name,
+                 const char *out_name, int is_compress, struct io_uring *ring_)
+{
+    int ret;
+    struct stat fstat;
+
+    ret = stat(in_name, &fstat);
+    if (ret) {
+        perror(in_name);
+        exit(-1);
+    }
+
+    if (S_ISDIR(fstat.st_mode)) {
+        processDir(sess, in_name, out_name, is_compress);
+    } else {
+        char oname[MAX_PATH_LEN];
+        qzMemSet(oname, 0, MAX_PATH_LEN);
+
+        if (makeOutName(in_name, out_name, oname, is_compress)) {
+            return;
+        }
+        doProcessFileIoUring(sess, in_name, oname, is_compress, ring_);
+    }
+}
+
 void version()
 {
     char const *const *p = g_license_msg;
@@ -652,3 +927,51 @@ exit:
     }
 }
 
+static IoUringFile_T *mallocIoUringFile(int fd)
+{
+    IoUringFile_T *io_uring_file = malloc(sizeof(IoUringFile_T));
+    CHECK_ALLOC_RETURN_VALUE(io_uring_file)
+    io_uring_file->fd = fd;
+    io_uring_file->off = 0;
+    return io_uring_file;
+}
+
+IoUringFile_T *generateIoUringFile(const char *file_name, int flags)
+{
+    int fd = open(file_name, flags);
+    if(fd < 0) {
+        return NULL;
+    }
+
+    return mallocIoUringFile(fd);
+}
+
+IoUringFile_T *generateIoUringFileWithMode(const char *file_name, int flags, mode_t mode)
+{
+    int fd = open(file_name, flags, mode);
+    if(fd < 0) {
+        return NULL;
+    }
+
+    return mallocIoUringFile(fd);
+}
+
+void freeIoUringFile(IoUringFile_T *iouringf) 
+{
+    close(iouringf->fd);
+    free(iouringf);
+}
+
+ssize_t getIoUringResult(struct io_uring *ring_)
+{
+    struct io_uring_cqe *cqe = NULL;
+    ssize_t res = 0;
+    if(io_uring_submit(ring_) != 1) {
+        QZ_ERROR("Io_Uring submit failed\n");
+        return -1;
+    }
+    io_uring_wait_cqe(ring_, &cqe);
+    res = cqe -> res;
+    io_uring_cqe_seen(ring_, cqe);
+    return res;
+}

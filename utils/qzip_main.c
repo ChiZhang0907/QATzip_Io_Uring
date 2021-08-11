@@ -72,6 +72,9 @@ int main(int argc, char **argv)
         case 'k':
             g_keep = 1;
             break;
+        case 'i':
+            g_io_uring = 0;
+            break;
         case 'V':
             version();
             exit(OK);
@@ -170,6 +173,14 @@ int main(int argc, char **argv)
     if (qatzipSetup(&g_sess, &g_params_th)) {
         exit(ERROR);
     }
+
+    if(g_io_uring) {
+        const int init_io_uring_res = io_uring_queue_init(256, &ring, 0);
+        if(init_io_uring_res != 0) {
+            g_io_uring = 0;
+        }
+    }
+    
     if (0 == arg_count) {
         if (isatty(fileno((FILE *)stdout)) && 0 == option_f &&
             0 == g_decompress) {
@@ -264,10 +275,19 @@ int main(int argc, char **argv)
                 }
 
             } else { // compress
-                processFile(&g_sess, argv[optind++], out_name,
+                if(g_io_uring) {
+                    processFileIoUring(&g_sess, argv[optind++], out_name,
+                            g_decompress == 0, &ring);
+                } else {
+                    processFile(&g_sess, argv[optind++], out_name,
                             g_decompress == 0);
+                }
             }
         }
+    }
+
+    if(g_io_uring) {
+        io_uring_queue_exit(&ring);
     }
 
     if (qatzipClose(&g_sess)) {
