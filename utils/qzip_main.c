@@ -153,6 +153,14 @@ int main(int argc, char **argv)
                 return -1;
             }
             break;
+        case 'a':
+            if(qatzipSetup(&g_sess, &g_params_th)) {
+                QZ_PRINT("The hardware is not availablt for QAT\n");
+                exit(ERROR);
+            } else {
+                QZ_PRINT("The hardware is available for QAT\n");
+                exit(0);
+            }
         default:
             tryHelp();
         }

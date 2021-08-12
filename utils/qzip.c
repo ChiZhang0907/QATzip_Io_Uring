@@ -51,7 +51,7 @@ struct io_uring ring;
 const unsigned int g_bufsz_expansion_ratio[] = {5, 20, 50, 100};
 
 /* Command line options*/
-char const g_short_opts[] = "A:H:L:C:r:o:O:P:dfhkVRi";
+char const g_short_opts[] = "A:H:L:C:r:o:O:P:dfhkVRia";
 const struct option g_long_opts[] = {
     /* { name  has_arg  *flag  val } */
     {"decompress", 0, 0, 'd'}, /* decompress */
@@ -61,6 +61,7 @@ const struct option g_long_opts[] = {
     {"keep",       0, 0, 'k'}, /* keep (don't delete) input files */
     {"io_uring",   0, 0, 'i'}, /* don't use io_uring to read and write files */
     {"version",    0, 0, 'V'}, /* display version number */
+    {"available",  0, 0, 'a'}, /* check the hardware environment */
     {"algorithm",  1, 0, 'A'}, /* set algorithm type */
     {"huffmanhdr", 1, 0, 'H'}, /* set huffman header type */
     {"level",      1, 0, 'L'}, /* set compression level */
@@ -97,6 +98,7 @@ void help(void)
         "  -H, --huffmanhdr  set huffman header type",
         "  -k, --keep        keep (don't delete) input files",
         "  -i, --io_uring    don't use io_uring to read and write files",
+        "  -a  --available   check the hardware environment",
         "  -V, --version     display version number",
         "  -L, --level       set compression level",
         "  -C, --chunksz     set chunk size",
