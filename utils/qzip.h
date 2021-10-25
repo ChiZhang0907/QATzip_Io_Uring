@@ -167,7 +167,7 @@ typedef enum QzSuffix_E {
     E_SUFFIX_UNKNOWN = 999
 } QzSuffix_T;
 
-#define SRC_BUFF_LEN         (512 * 1024 * 1024)
+#define SRC_BUFF_LEN         (4 * 1024 * 1024)
 
 
 #define QZ7Z_PROPERTY_ID_INTEL7Z_1001   ((QZ7Z_DEVELOP_PREFIX << 56) | \
@@ -781,6 +781,7 @@ extern char *g_program_name;
 extern int g_decompress;        /* g_decompress (-d) */
 extern int g_keep;                     /* keep (don't delete) input files */
 extern int g_io_uring;
+extern int g_speed;
 extern QzSession_T g_sess;
 extern QzSessionParams_T g_params_th;
 /* Estimate maximum data expansion after decompression */

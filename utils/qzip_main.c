@@ -133,6 +133,14 @@ int main(int argc, char **argv)
                 return -1;
             }
             break;
+        case 'S':
+            g_speed = GET_LOWER_32BITS(strtoul(optarg, &stop, 0));
+            if (*stop != '\0' || ERANGE == errno ||
+                g_speed <= 0) {
+                QZ_ERROR("Error speed limitation: %s\n", optarg);
+                return -1;
+            }
+            break;
         case 'r':
             g_params_th.req_cnt_thrshold =
                 GET_LOWER_32BITS(strtoul(optarg, &stop, 0));

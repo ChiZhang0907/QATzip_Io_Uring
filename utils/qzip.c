@@ -43,6 +43,7 @@ char *g_program_name = NULL; /* program name */
 int g_decompress = 0;        /* g_decompress (-d) */
 int g_keep = 0;                     /* keep (don't delete) input files */
 int g_io_uring = 1;
+int g_speed = 0;
 QzSession_T g_sess;
 QzSessionParams_T g_params_th = {(QzHuffmanHdr_T)0,};
 struct io_uring ring;
@@ -51,7 +52,7 @@ struct io_uring ring;
 const unsigned int g_bufsz_expansion_ratio[] = {5, 20, 50, 100};
 
 /* Command line options*/
-char const g_short_opts[] = "A:H:L:C:r:o:O:P:dfhkVRia";
+char const g_short_opts[] = "A:H:L:C:S:r:o:O:P:dfhkVRia";
 const struct option g_long_opts[] = {
     /* { name  has_arg  *flag  val } */
     {"decompress", 0, 0, 'd'}, /* decompress */
@@ -66,6 +67,7 @@ const struct option g_long_opts[] = {
     {"huffmanhdr", 1, 0, 'H'}, /* set huffman header type */
     {"level",      1, 0, 'L'}, /* set compression level */
     {"chunksz",    1, 0, 'C'}, /* set chunk size */
+    {"speed",      1, 0, 'S'}, /* set compression speed limitaion */
     {"output",     1, 0, 'O'}, /* set output header format(gzip, gzipext, 7z)*/
     {"recursive",  0, 0, 'R'}, /* set recursive mode when compressing a
                                   directory */
@@ -102,6 +104,7 @@ void help(void)
         "  -V, --version     display version number",
         "  -L, --level       set compression level",
         "  -C, --chunksz     set chunk size",
+        "  -S  --speed       set compression speed limitation",
         "  -O, --output      set output header format(gzip|gzipext|7z)",
         "  -r,               set max inflight request number",
         "  -R,               set Recursive mode for a directory",
@@ -322,6 +325,10 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
 {
     int ret = OK;
     struct stat src_file_stat;
+    struct timeval speed_time;
+    struct timeval speed_time_tmp;
+    off_t speed_size = 0, speed_limitation = g_speed * 1024 * 1024;
+    useconds_t speed_val = 0;
     unsigned int src_buffer_size = 0;
     unsigned int dst_buffer_size = 0;
     off_t src_file_size = 0, dst_file_size = 0, file_remaining = 0;
@@ -389,7 +396,27 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
 
     file_remaining = src_file_size;
     read_more = 1;
+    
+    if(g_speed > 0) {
+        gettimeofday(&speed_time, NULL);
+    }
+    
     do {
+        if(g_speed > 0) {
+            gettimeofday(&speed_time_tmp, NULL);
+            speed_val =  (speed_time_tmp.tv_sec * 1000000 + speed_time_tmp.tv_usec) - (speed_time.tv_sec * 1000000 + speed_time.tv_usec);
+            if(speed_val > 1000000) {
+                speed_time.tv_sec = speed_time_tmp.tv_sec;
+                speed_time.tv_usec = speed_time_tmp.tv_usec;
+                speed_size = 0;
+            } else if (speed_size >= speed_limitation) {
+                useconds_t sleep_time = 1000000 - speed_val;
+                usleep(sleep_time);
+                gettimeofday(&speed_time, NULL);
+                speed_size = 0;
+            }
+        }
+
         if (read_more) {
             bytes_read = fread(src_buffer, 1, src_buffer_size, src_file);
             QZ_PRINT("Reading input file %s (%u Bytes)\n", src_file_name,
@@ -446,6 +473,7 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
         }
 
         file_remaining -= bytes_read;
+        speed_size += bytes_read;
     } while (file_remaining > 0);
 
     displayStats(time_list_head, src_file_size, dst_file_size, is_compress);
@@ -469,6 +497,10 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
 {
     int ret = OK;
     struct stat src_file_stat;
+    struct timeval speed_time;
+    struct timeval speed_time_tmp;
+    off_t speed_size = 0, speed_limitation = g_speed * 1024 * 1024;
+    useconds_t speed_val = 0;
     unsigned int src_buffer_size = 0;
     unsigned int dst_buffer_size = 0;
     off_t src_file_size = 0, dst_file_size = 0, file_remaining = 0;
@@ -545,7 +577,27 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
 
     file_remaining = src_file_size;
     read_more = 1;
+
+    if(g_speed > 0) {
+        gettimeofday(&speed_time, NULL);
+    }
+
     do {
+        if(g_speed > 0) {
+            gettimeofday(&speed_time_tmp, NULL);
+            speed_val =  (speed_time_tmp.tv_sec * 1000000 + speed_time_tmp.tv_usec) - (speed_time.tv_sec * 1000000 + speed_time.tv_usec);
+            if(speed_val > 1000000) {
+                speed_time.tv_sec = speed_time_tmp.tv_sec;
+                speed_time.tv_usec = speed_time_tmp.tv_usec;
+                speed_size = 0;
+            } else if (speed_size >= speed_limitation) {
+                useconds_t sleep_time = 1000000 - speed_val;
+                usleep(sleep_time);
+                gettimeofday(&speed_time, NULL);
+                speed_size = 0;
+            }
+        }
+
         if (read_more) {
             ssize_t bytes_read_temp = 0;
             sqe = io_uring_get_sqe(ring_);
@@ -609,6 +661,7 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
         }
 
         file_remaining -= bytes_read;
+        speed_size += bytes_read;
     } while (file_remaining > 0);
 
     displayStats(time_list_head, src_file_size, dst_file_size, is_compress);
