@@ -156,6 +156,7 @@
 #define QZ7Z_ERR_SIG_HEADER           -223
 #define QZ7Z_ERR_RESOLVE_SUBSTREAMS   -224
 #define QZ7Z_ERR_UNEXPECTED           -225
+#define QZ7Z_ERR_MALLOC               -226
 
 #define MAX_PATH_LEN   1024 /* max pathname length */
 #define SUFFIX_GZ      ".gz"

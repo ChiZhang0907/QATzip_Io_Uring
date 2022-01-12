@@ -152,7 +152,10 @@ void displayStats(RunTimeList_T *time_list,
     }
 
     if (insize) {
-        assert(0 != us_diff);
+        if (0 == us_diff) {
+            QZ_ERROR("The size do not change afteer compression\n");
+            exit(QZ7Z_ERR_INVALID_SIZE);
+        }
         double size = (is_compress) ? insize : outsize;
         double throughput = (size * CHAR_BIT) / us_diff; /* in MB (megabytes) */
         double compressionRatio = ((double)insize) / ((double)outsize);
@@ -188,7 +191,10 @@ int doProcessBuffer(QzSession_T *sess,
 
     while (!done) {
         RunTimeList_T *run_time = calloc(1, sizeof(RunTimeList_T));
-        assert(NULL != run_time);
+        if (NULL == run_time) {
+            QZ_ERROR("Malloc run_time error.\n");
+            exit(QZ7Z_ERR_MALLOC);
+        }
         run_time->next = NULL;
         time_node->next = run_time;
         time_node = run_time;
@@ -221,7 +227,10 @@ int doProcessBuffer(QzSession_T *sess,
         gettimeofday(&run_time->time_e, NULL);
 
         bytes_written = fwrite(dst, 1, dst_len, dst_file);
-        assert(bytes_written == dst_len);
+        if (bytes_written != dst_len) {
+            QZ_ERROR("Fwrite write less bytes than expected.\n");
+            exit(QZ7Z_ERR_WRITE_LESS);
+        }
         *dst_file_size += bytes_written;
 
         buf_processed += *src_len;
@@ -263,7 +272,10 @@ int doProcessBufferIoUring(QzSession_T *sess,
 
     while (!done) {
         RunTimeList_T *run_time = calloc(1, sizeof(RunTimeList_T));
-        assert(NULL != run_time);
+        if (NULL == run_time) {
+            QZ_ERROR("Malloc run_rime error\n");
+            exit(QZ7Z_ERR_MALLOC);
+        }
         run_time->next = NULL;
         time_node->next = run_time;
         time_node = run_time;
@@ -344,7 +356,11 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
     unsigned int read_more = 0;
     int src_fd = 0;
     RunTimeList_T *time_list_head = malloc(sizeof(RunTimeList_T));
-    assert(NULL != time_list_head);
+    if (NULL == time_list_head) {
+        QZ_ERROR("Malloc time_list error\n");
+        ret = QZ7Z_ERR_MALLOC;
+        goto exit;
+    }
     gettimeofday(&time_list_head->time_s, NULL);
     time_list_head->time_e = time_list_head->time_s;
     time_list_head->next = NULL;
@@ -386,13 +402,29 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
     }
 
     src_buffer = malloc(src_buffer_size);
-    assert(src_buffer != NULL);
+    if (src_buffer == NULL) {
+        QZ_ERROR("Malloc src_buffer error\n");
+        ret = QZ7Z_ERR_MALLOC;
+        goto exit;
+    }
     dst_buffer = malloc(dst_buffer_size);
-    assert(dst_buffer != NULL);
+    if (dst_buffer == NULL) {
+        QZ_ERROR("Malloc dst_buffer error\n");
+        ret = QZ7Z_ERR_MALLOC;
+        goto exit;
+    }
     src_file = fopen(src_file_name, "r");
-    assert(src_file != NULL);
+    if (src_file == NULL) {
+        QZ_ERROR("Cannot open file: %s.\n", src_file_name);
+        ret = QZ7Z_ERR_OPEN;
+        goto exit;
+    }
     dst_file = fopen(dst_file_name, "w");
-    assert(dst_file != NULL);
+    if (dst_file == NULL) {
+        QZ_ERROR("Cannot open file: %s.\n", dst_file_name);
+        ret = QZ7Z_ERR_OPEN;
+        goto exit;
+    }
 
     file_remaining = src_file_size;
     read_more = 1;
@@ -479,11 +511,21 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
     displayStats(time_list_head, src_file_size, dst_file_size, is_compress);
 
 exit:
-    freeTimeList(time_list_head);
-    fclose(src_file);
-    fclose(dst_file);
-    free(src_buffer);
-    free(dst_buffer);
+    if (time_list_head) {
+        freeTimeList(time_list_head);
+    }
+    if (src_file) {
+        fclose(src_file);
+    }
+    if (dst_file) {
+        fclose(dst_file);
+    }
+    if (src_buffer) {
+        free(src_buffer);
+    }
+    if (dst_buffer) {
+        free(dst_buffer);
+    }
     if (!g_keep && OK == ret) {
         unlink(src_file_name);
     }
@@ -517,7 +559,11 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
     unsigned int read_more = 0;
     int src_fd = 0;
     RunTimeList_T *time_list_head = malloc(sizeof(RunTimeList_T));
-    assert(NULL != time_list_head);
+    if (NULL == time_list_head) {
+        QZ_ERROR("Malloc time_list error.\n");
+        ret = QZ7Z_ERR_MALLOC;
+        goto exit;
+    }
     gettimeofday(&time_list_head->time_s, NULL);
     time_list_head->time_e = time_list_head->time_s;
     time_list_head->next = NULL;
@@ -559,9 +605,17 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
     }
 
     src_buffer = malloc(src_buffer_size);
-    assert(src_buffer != NULL);
+    if (src_buffer == NULL) {
+        QZ_ERROR("Malloc src_buffer error.\n");
+        ret = QZ7Z_ERR_MALLOC;
+        goto exit;
+    }
     dst_buffer = malloc(dst_buffer_size);
-    assert(dst_buffer != NULL);
+    if (dst_buffer == NULL) {
+        QZ_ERROR("Malloc dst_buffer error.\n");
+        ret = QZ7Z_ERR_MALLOC;
+        goto exit;
+    }
     src_file = generateIoUringFile(src_file_name, O_RDONLY);
     if(!src_file) {
         QZ_ERROR("Cannot open file: %s\n", src_file_name);
@@ -667,15 +721,21 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
     displayStats(time_list_head, src_file_size, dst_file_size, is_compress);
 
 exit:
-    freeTimeList(time_list_head);
-    if(!src_file) {
+    if (time_list_head) {
+        freeTimeList(time_list_head);
+    }
+    if (src_file) {
         freeIoUringFile(src_file);
     }
-    if(!dst_file) {
+    if (dst_file) {
         freeIoUringFile(dst_file);
     }
-    free(src_buffer);
-    free(dst_buffer);
+    if (src_buffer) {
+        free(src_buffer);
+    }
+    if (dst_buffer) {
+        free(dst_buffer);
+    }
     if (!g_keep && OK == ret) {
         unlink(src_file_name);
     }
@@ -776,7 +836,8 @@ void mkPath(char *path, const char *dirpath, char *file)
     if (strlen(dirpath) + strlen(file) + 1 < MAX_PATH_LEN) {
         snprintf(path, MAX_PATH_LEN, "%s/%s", dirpath, file);
     } else {
-        assert(0);
+        QZ_ERROR("The path exceeds the max len.\n");
+        exit(QZ7Z_ERR_INVALID_SIZE);
     }
 }
 
@@ -789,7 +850,10 @@ void processDir(QzSession_T *sess, const char *in_name,
     char inpath[MAX_PATH_LEN];
 
     dir = opendir(in_name);
-    assert(dir);
+    if (!dir) {
+        QZ_ERROR("Cannot open dir: %s.\n", in_name);
+        exit(QZ7Z_ERR_OPEN);
+    }
 
     while ((entry = readdir(dir))) {
         /* Ignore anything starting with ".", which includes the special
@@ -891,7 +955,11 @@ void processStream(QzSession_T *sess, FILE *src_file, FILE *dst_file,
         sizeof(g_bufsz_expansion_ratio) / sizeof(unsigned int);
     unsigned int read_more = 0;
     RunTimeList_T *time_list_head = malloc(sizeof(RunTimeList_T));
-    assert(NULL != time_list_head);
+    if (NULL == time_list_head) {
+        QZ_ERROR("Malloc time_list error.\n");
+        ret = QZ7Z_ERR_MALLOC;
+        goto exit;
+    }
     gettimeofday(&time_list_head->time_s, NULL);
     time_list_head->time_e = time_list_head->time_s;
     time_list_head->next = NULL;
@@ -907,9 +975,17 @@ void processStream(QzSession_T *sess, FILE *src_file, FILE *dst_file,
     }
 
     src_buffer = malloc(src_buffer_size);
-    assert(src_buffer != NULL);
+    if (src_buffer == NULL) {
+        QZ_ERROR("Malloc src_buffer error.\n");
+        ret = QZ7Z_ERR_MALLOC;
+        goto exit;
+    }
     dst_buffer = malloc(dst_buffer_size);
-    assert(dst_buffer != NULL);
+    if (dst_buffer == NULL) {
+        QZ_ERROR("Malloc dst_buffer error.\n");
+        ret = QZ7Z_ERR_MALLOC;
+        goto exit;
+    }
 
     read_more = 1;
     while (!feof(stdin)) {
@@ -973,9 +1049,15 @@ void processStream(QzSession_T *sess, FILE *src_file, FILE *dst_file,
     }
 
 exit:
-    freeTimeList(time_list_head);
-    free(src_buffer);
-    free(dst_buffer);
+    if (time_list_head) {
+        freeTimeList(time_list_head);
+    }
+    if (src_buffer) {
+        free(src_buffer);
+    }
+    if (dst_buffer) {
+        free(dst_buffer);
+    }
 
     if (ret) {
         exit(ret);
