@@ -75,6 +75,9 @@ int main(int argc, char **argv)
         case 'i':
             g_io_uring = 0;
             break;
+        case 'D':
+            g_o_direct = 0;
+            break;
         case 'V':
             version();
             exit(OK);

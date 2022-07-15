@@ -44,6 +44,7 @@ int g_decompress = 0;        /* g_decompress (-d) */
 int g_keep = 0;                     /* keep (don't delete) input files */
 int g_io_uring = 1;
 int g_speed = 0;
+int g_o_direct = 1;
 QzSession_T g_sess;
 QzSessionParams_T g_params_th = {(QzHuffmanHdr_T)0,};
 struct io_uring ring;
@@ -52,7 +53,7 @@ struct io_uring ring;
 const unsigned int g_bufsz_expansion_ratio[] = {5, 20, 50, 100};
 
 /* Command line options*/
-char const g_short_opts[] = "A:H:L:C:S:r:o:O:P:dfhkVRia";
+char const g_short_opts[] = "A:H:L:C:S:r:o:O:P:dfhkVRiaD";
 const struct option g_long_opts[] = {
     /* { name  has_arg  *flag  val } */
     {"decompress", 0, 0, 'd'}, /* decompress */
@@ -61,6 +62,7 @@ const struct option g_long_opts[] = {
     {"help",       0, 0, 'h'}, /* give help */
     {"keep",       0, 0, 'k'}, /* keep (don't delete) input files */
     {"io_uring",   0, 0, 'i'}, /* don't use io_uring to read and write files */
+    {"no_direct",  0, 0, 'D'}, /* don't use O_DIRECT flag to read and write files */
     {"version",    0, 0, 'V'}, /* display version number */
     {"available",  0, 0, 'a'}, /* check the hardware environment */
     {"algorithm",  1, 0, 'A'}, /* set algorithm type */
@@ -100,6 +102,7 @@ void help(void)
         "  -H, --huffmanhdr  set huffman header type",
         "  -k, --keep        keep (don't delete) input files",
         "  -i, --io_uring    don't use io_uring to read and write files",
+        "  -D, --no_direct   don't use O_DIRECT to read and write files",
         "  -a  --available   check the hardware environment",
         "  -V, --version     display version number",
         "  -L, --level       set compression level",
@@ -346,7 +349,7 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
     off_t src_file_size = 0, dst_file_size = 0, file_remaining = 0;
     unsigned char *src_buffer = NULL;
     unsigned char *dst_buffer = NULL;
-    FILE *src_file = NULL;
+    IoUringFile_T *src_file = NULL;
     FILE *dst_file = NULL;
     unsigned int bytes_read = 0;
     unsigned long bytes_processed = 0;
@@ -390,6 +393,11 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
     }
     src_buffer_size = (src_file_size > SRC_BUFF_LEN) ?
                       SRC_BUFF_LEN : src_file_size;
+    
+    if (src_buffer_size % 4096 != 0) {
+        src_buffer_size = 4096 - (src_buffer_size % 4096) + src_buffer_size;
+    }
+
     if (is_compress) {
         dst_buffer_size = qzMaxCompressedLength(src_buffer_size, sess);
     } else { /* decompress */
@@ -401,7 +409,7 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
         dst_buffer_size = 1024;
     }
 
-    src_buffer = malloc(src_buffer_size);
+    src_buffer = aligned_alloc(4096, src_buffer_size);
     if (src_buffer == NULL) {
         QZ_ERROR("Malloc src_buffer error\n");
         ret = QZ7Z_ERR_MALLOC;
@@ -413,7 +421,11 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
         ret = QZ7Z_ERR_MALLOC;
         goto exit;
     }
-    src_file = fopen(src_file_name, "r");
+    if (g_o_direct) {
+        src_file = generateIoUringFile(src_file_name, O_RDONLY | O_DIRECT);
+    } else {
+        src_file = generateIoUringFile(src_file_name, O_RDONLY);
+    }
     if (src_file == NULL) {
         QZ_ERROR("Cannot open file: %s.\n", src_file_name);
         ret = QZ7Z_ERR_OPEN;
@@ -450,9 +462,16 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
         }
 
         if (read_more) {
-            bytes_read = fread(src_buffer, 1, src_buffer_size, src_file);
+            ssize_t bytes_read_temp = 0;
+            bytes_read_temp = pread(src_file->fd, src_buffer, src_buffer_size, src_file->off);
+            if (bytes_read_temp <= 0) {
+                bytes_read = 0;
+            } else {
+                bytes_read =bytes_read_temp;
+            }
             QZ_PRINT("Reading input file %s (%u Bytes)\n", src_file_name,
                      bytes_read);
+            src_file->off += bytes_read;
         } else {
             bytes_read = file_remaining;
         }
@@ -466,10 +485,7 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
         if (QZ_DATA_ERROR == ret || QZ_BUF_ERROR == ret) {
             bytes_processed += bytes_read;
             if (0 != bytes_read) {
-                if (-1 == fseek(src_file, bytes_processed, SEEK_SET)) {
-                    ret = ERROR;
-                    goto exit;
-                }
+                src_file->off = bytes_processed;
                 read_more = 1;
             } else if (QZ_BUF_ERROR == ret) {
                 //dest buffer not long enough
@@ -506,6 +522,11 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
 
         file_remaining -= bytes_read;
         speed_size += bytes_read;
+
+        if (g_o_direct && bytes_read % 4096 != 0) {
+            fcntl(src_file->fd, F_SETFL, O_RDONLY);
+            g_o_direct = 0;
+        }
     } while (file_remaining > 0);
 
     displayStats(time_list_head, src_file_size, dst_file_size, is_compress);
@@ -515,7 +536,7 @@ exit:
         freeTimeList(time_list_head);
     }
     if (src_file) {
-        fclose(src_file);
+        freeIoUringFile(src_file);
     }
     if (dst_file) {
         fclose(dst_file);
@@ -593,6 +614,9 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
     }
     src_buffer_size = (src_file_size > SRC_BUFF_LEN) ?
                       SRC_BUFF_LEN : src_file_size;
+    if (src_buffer_size % 4096 != 0) {
+        src_buffer_size = 4096 - (src_buffer_size % 4096) + src_buffer_size;
+    }
     if (is_compress) {
         dst_buffer_size = qzMaxCompressedLength(src_buffer_size, sess);
     } else { /* decompress */
@@ -604,7 +628,7 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
         dst_buffer_size = 1024;
     }
 
-    src_buffer = malloc(src_buffer_size);
+    src_buffer = aligned_alloc(4096, src_buffer_size);
     if (src_buffer == NULL) {
         QZ_ERROR("Malloc src_buffer error.\n");
         ret = QZ7Z_ERR_MALLOC;
@@ -616,7 +640,11 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
         ret = QZ7Z_ERR_MALLOC;
         goto exit;
     }
-    src_file = generateIoUringFile(src_file_name, O_RDONLY);
+    if (g_o_direct) {
+        src_file = generateIoUringFile(src_file_name, O_RDONLY | O_DIRECT);
+    } else {
+        src_file = generateIoUringFile(src_file_name, O_RDONLY);
+    }
     if(!src_file) {
         QZ_ERROR("Cannot open file: %s\n", src_file_name);
         ret = QZ7Z_ERR_OPEN;
@@ -716,6 +744,11 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
 
         file_remaining -= bytes_read;
         speed_size += bytes_read;
+
+        if (g_o_direct && bytes_read % 4096 != 0) {
+            fcntl(src_file->fd, F_SETFL, O_RDONLY);
+            g_o_direct = 0;
+        }
     } while (file_remaining > 0);
 
     displayStats(time_list_head, src_file_size, dst_file_size, is_compress);

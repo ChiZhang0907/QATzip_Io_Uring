@@ -33,6 +33,7 @@
  *
  ***************************************************************************/
 
+#define _GNU_SOURCE
 #ifndef _UTILS_QZIP_H
 #define _UTILS_QZIP_H
 
@@ -793,5 +794,6 @@ extern const struct option g_long_opts[];
 extern const unsigned int USDM_ALLOC_MAX_SZ;
 extern int errno;
 extern struct io_uring ring;
+extern int g_o_direct;
 
 #endif
