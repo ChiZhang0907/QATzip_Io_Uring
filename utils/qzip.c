@@ -554,7 +554,7 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
         ret = QZ7Z_ERR_MALLOC;
         goto exit;
     }
-    if (g_o_direct) {
+    if (g_read_o_direct) {
         src_file = generateIoUringFile(src_file_name, O_RDONLY | O_DIRECT);
     } else {
         src_file = generateIoUringFile(src_file_name, O_RDONLY);
@@ -673,7 +673,7 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
             fcntl(dst_file->fd, F_SETFL, O_WRONLY | O_CREAT | O_TRUNC);
             g_write_o_direct = 0;
         }
-        int bytes_written = pwrite(dst_file->fd, dest_buffer->buffer, dest_buffer->off, dst_file->fd);
+        int bytes_written = pwrite(dst_file->fd, dest_buffer->buffer, dest_buffer->off, dst_file->off);
         if (bytes_written != dest_buffer->off) {
             QZ_ERROR("pwrite write less bytes than expected.\n");
             exit(QZ7Z_ERR_WRITE_LESS);
