@@ -77,6 +77,8 @@ int main(int argc, char **argv)
             break;
         case 'D':
             g_o_direct = 0;
+            g_read_o_direct = 0;
+            g_write_o_direct = 0;
             break;
         case 'V':
             version();

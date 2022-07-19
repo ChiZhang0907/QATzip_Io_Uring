@@ -45,6 +45,8 @@ int g_keep = 0;                     /* keep (don't delete) input files */
 int g_io_uring = 1;
 int g_speed = 0;
 int g_o_direct = 1;
+int g_read_o_direct = 1;
+int g_write_o_direct =1;
 QzSession_T g_sess;
 QzSessionParams_T g_params_th = {(QzHuffmanHdr_T)0,};
 struct io_uring ring;
@@ -253,11 +255,111 @@ int doProcessBuffer(QzSession_T *sess,
     return ret;
 }
 
-int doProcessBufferIoUring(QzSession_T *sess,
+int doProcessBufferDirect(QzSession_T *sess,
                     unsigned char *src, unsigned int *src_len,
                     unsigned char *dst, unsigned int dst_len,
                     RunTimeList_T *time_list, IoUringFile_T *dst_file,
-                    off_t *dst_file_size, int is_compress, struct io_uring *ring_)
+                    off_t *dst_file_size, int is_compress,
+                    DestBuffer_T* dest_buffer)
+{
+    int ret = QZ_FAIL;
+    unsigned int done = 0;
+    unsigned int buf_processed = 0;
+    unsigned int buf_remaining = *src_len;
+    ssize_t bytes_written = 0;
+    unsigned int valid_dst_buf_len = dst_len;
+    RunTimeList_T *time_node = time_list;
+
+
+    while (time_node->next) {
+        time_node = time_node->next;
+    }
+
+    while (!done) {
+        RunTimeList_T *run_time = calloc(1, sizeof(RunTimeList_T));
+        if (NULL == run_time) {
+            QZ_ERROR("Malloc run_time error.\n");
+            exit(QZ7Z_ERR_MALLOC);
+        }
+        run_time->next = NULL;
+        time_node->next = run_time;
+        time_node = run_time;
+
+        gettimeofday(&run_time->time_s, NULL);
+
+        /* Do actual work */
+        if (is_compress) {
+            ret = qzCompress(sess, src, src_len, dst, &dst_len, 1);
+            if (QZ_BUF_ERROR == ret && 0 == *src_len) {
+                done = 1;
+            }
+        } else {
+            ret = qzDecompress(sess, src, src_len, dst, &dst_len);
+
+            if (QZ_DATA_ERROR == ret ||
+                (QZ_BUF_ERROR == ret && 0 == *src_len)) {
+                done = 1;
+            }
+        }
+
+        if (ret != QZ_OK &&
+            ret != QZ_BUF_ERROR &&
+            ret != QZ_DATA_ERROR) {
+            const char *op = (is_compress) ? "Compression" : "Decompression";
+            QZ_ERROR("doProcessBuffer:%s failed with error: %d\n", op, ret);
+            break;
+        }
+
+        gettimeofday(&run_time->time_e, NULL);
+        unsigned int remain_len = dst_len;
+        unsigned char *dst_buffer_head = dst;
+        while(remain_len > 0) {
+            unsigned int buffer_reamin_size = dest_buffer->size - dest_buffer->off;
+            unsigned int copy_size = 0;
+            if (buffer_reamin_size > remain_len) {
+                copy_size = remain_len;
+            } else {
+                copy_size = buffer_reamin_size;
+            }
+            memcpy(dest_buffer->buffer + dest_buffer->off, dst_buffer_head, copy_size);
+            dst_buffer_head = dst_buffer_head + copy_size;
+            dest_buffer->off += copy_size;
+            remain_len -= copy_size;
+            if (dest_buffer->off == dest_buffer->size) {
+                bytes_written = pwrite(dst_file->fd, dest_buffer->buffer, dest_buffer->size, dst_file->off);
+                if (bytes_written != dest_buffer->size) {
+                    QZ_ERROR("Fwrite write less bytes than expected.\n");
+                    exit(QZ7Z_ERR_WRITE_LESS);
+                }
+                *dst_file_size += bytes_written;
+                dst_file->off += bytes_written;
+                dest_buffer->off = 0;
+            }
+        }
+
+        buf_processed += *src_len;
+        buf_remaining -= *src_len;
+        if (0 == buf_remaining) {
+            done = 1;
+        }
+        src += *src_len;
+        QZ_DEBUG("src_len is %u ,buf_remaining is %u\n", *src_len,
+                 buf_remaining);
+        *src_len = buf_remaining;
+        dst_len = valid_dst_buf_len;
+        bytes_written = 0;
+    }
+
+    *src_len = buf_processed;
+    return ret;
+}
+
+int doProcessBufferIoUringDirect(QzSession_T *sess,
+                    unsigned char *src, unsigned int *src_len,
+                    unsigned char *dst, unsigned int dst_len,
+                    RunTimeList_T *time_list, IoUringFile_T *dst_file,
+                    off_t *dst_file_size, int is_compress, struct io_uring *ring_,
+                    DestBuffer_T *dest_buffer)
 {
     int ret = QZ_FAIL;
     unsigned int done = 0;
@@ -310,13 +412,31 @@ int doProcessBufferIoUring(QzSession_T *sess,
 
         gettimeofday(&run_time->time_e, NULL);
 
-        sqe = io_uring_get_sqe(ring_);
-        CHECK_GET_SQE(sqe)
-        io_uring_prep_write(sqe, dst_file->fd, dst, dst_len, dst_file->off);
-        bytes_written = getIoUringResult(ring_);
-        CHECK_IO_URING_WRITE_RETURN(bytes_written, dst_len, "compress")
-        *dst_file_size += bytes_written;
-        dst_file->off += bytes_written;
+        unsigned int remain_len = dst_len;
+        unsigned char *dst_buffer_head = dst;
+        while(remain_len > 0) {
+            unsigned int buffer_reamin_size = dest_buffer->size - dest_buffer->off;
+            unsigned int copy_size = 0;
+            if (buffer_reamin_size > remain_len) {
+                copy_size = remain_len;
+            } else {
+                copy_size = buffer_reamin_size;
+            }
+            memcpy(dest_buffer->buffer + dest_buffer->off, dst_buffer_head, copy_size);
+            dst_buffer_head = dst_buffer_head + copy_size;
+            dest_buffer->off += copy_size;
+            remain_len -= copy_size;
+            if (dest_buffer->off == dest_buffer->size) {
+                sqe = io_uring_get_sqe(ring_);
+                CHECK_GET_SQE(sqe)
+                io_uring_prep_write(sqe, dst_file->fd, dest_buffer->buffer, dest_buffer->size, dst_file->off);
+                bytes_written = getIoUringResult(ring_);
+                CHECK_IO_URING_WRITE_RETURN(bytes_written, dest_buffer->size, "compress")
+                *dst_file_size += bytes_written;
+                dst_file->off += bytes_written;
+                dest_buffer->off = 0;
+            }
+        }
 
         buf_processed += *src_len;
         buf_remaining -= *src_len;
@@ -346,11 +466,13 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
     useconds_t speed_val = 0;
     unsigned int src_buffer_size = 0;
     unsigned int dst_buffer_size = 0;
+    unsigned int dest_buffer_size = 0;
     off_t src_file_size = 0, dst_file_size = 0, file_remaining = 0;
     unsigned char *src_buffer = NULL;
     unsigned char *dst_buffer = NULL;
     IoUringFile_T *src_file = NULL;
-    FILE *dst_file = NULL;
+    IoUringFile_T *dst_file = NULL;
+    DestBuffer_T* dest_buffer = NULL;
     unsigned int bytes_read = 0;
     unsigned long bytes_processed = 0;
     unsigned int ratio_idx = 0;
@@ -409,6 +531,11 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
         dst_buffer_size = 1024;
     }
 
+    dest_buffer_size = (dst_buffer_size > DST_BUFF_LEN) ? DST_BUFF_LEN : dst_buffer_size;
+    if (dest_buffer_size % 4096 != 0) {
+        dest_buffer_size = 4096 - (dest_buffer_size % 4096) + dest_buffer_size;
+    }
+
     src_buffer = aligned_alloc(4096, src_buffer_size);
     if (src_buffer == NULL) {
         QZ_ERROR("Malloc src_buffer error\n");
@@ -418,6 +545,12 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
     dst_buffer = malloc(dst_buffer_size);
     if (dst_buffer == NULL) {
         QZ_ERROR("Malloc dst_buffer error\n");
+        ret = QZ7Z_ERR_MALLOC;
+        goto exit;
+    }
+    dest_buffer = generateDestBuffer(dest_buffer_size);
+    if (dest_buffer == NULL) {
+        QZ_ERROR("Malloc dest_buffer error\n");
         ret = QZ7Z_ERR_MALLOC;
         goto exit;
     }
@@ -431,9 +564,15 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
         ret = QZ7Z_ERR_OPEN;
         goto exit;
     }
-    dst_file = fopen(dst_file_name, "w");
-    if (dst_file == NULL) {
-        QZ_ERROR("Cannot open file: %s.\n", dst_file_name);
+
+    if (g_o_direct) {
+        dst_file = generateIoUringFileWithMode(dst_file_name, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+    } else {
+        dst_file = generateIoUringFileWithMode(dst_file_name, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+    }
+
+    if(!dst_file) {
+        QZ_ERROR("Cannot open file: %s\n", dst_file_name);
         ret = QZ7Z_ERR_OPEN;
         goto exit;
     }
@@ -469,18 +608,18 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
             } else {
                 bytes_read =bytes_read_temp;
             }
-            QZ_PRINT("Reading input file %s (%u Bytes)\n", src_file_name,
-                     bytes_read);
+            //QZ_PRINT("Reading input file %s (%u Bytes)\n", src_file_name,
+            //         bytes_read);
             src_file->off += bytes_read;
         } else {
             bytes_read = file_remaining;
         }
 
-        puts((is_compress) ? "Compressing..." : "Decompressing...");
+        //puts((is_compress) ? "Compressing..." : "Decompressing...");
 
-        ret = doProcessBuffer(sess, src_buffer, &bytes_read, dst_buffer,
+        ret = doProcessBufferDirect(sess, src_buffer, &bytes_read, dst_buffer,
                               dst_buffer_size, time_list_head, dst_file,
-                              &dst_file_size, is_compress);
+                              &dst_file_size, is_compress, dest_buffer);
 
         if (QZ_DATA_ERROR == ret || QZ_BUF_ERROR == ret) {
             bytes_processed += bytes_read;
@@ -523,11 +662,26 @@ void doProcessFile(QzSession_T *sess, const char *src_file_name,
         file_remaining -= bytes_read;
         speed_size += bytes_read;
 
-        if (g_o_direct && bytes_read % 4096 != 0) {
+        if (g_read_o_direct && bytes_read % 4096 != 0) {
             fcntl(src_file->fd, F_SETFL, O_RDONLY);
-            g_o_direct = 0;
+            g_read_o_direct = 0;
         }
     } while (file_remaining > 0);
+
+    if (dest_buffer->off != 0) {
+        if (g_write_o_direct && dest_buffer->off % 4096 != 0) {
+            fcntl(dst_file->fd, F_SETFL, O_WRONLY | O_CREAT | O_TRUNC);
+            g_write_o_direct = 0;
+        }
+        int bytes_written = pwrite(dst_file->fd, dest_buffer->buffer, dest_buffer->off, dst_file->fd);
+        if (bytes_written != dest_buffer->off) {
+            QZ_ERROR("pwrite write less bytes than expected.\n");
+            exit(QZ7Z_ERR_WRITE_LESS);
+        }
+        dst_file_size += bytes_written;
+        dst_file->off += bytes_written;
+        dest_buffer->off = 0;
+    }
 
     displayStats(time_list_head, src_file_size, dst_file_size, is_compress);
 
@@ -539,13 +693,16 @@ exit:
         freeIoUringFile(src_file);
     }
     if (dst_file) {
-        fclose(dst_file);
+        freeIoUringFile(dst_file);
     }
     if (src_buffer) {
         free(src_buffer);
     }
     if (dst_buffer) {
         free(dst_buffer);
+    }
+    if (dest_buffer) {
+        freeDestBuffer(dest_buffer);
     }
     if (!g_keep && OK == ret) {
         unlink(src_file_name);
@@ -566,9 +723,11 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
     useconds_t speed_val = 0;
     unsigned int src_buffer_size = 0;
     unsigned int dst_buffer_size = 0;
+    unsigned int dest_buffer_size = 0;
     off_t src_file_size = 0, dst_file_size = 0, file_remaining = 0;
     unsigned char *src_buffer = NULL;
     unsigned char *dst_buffer = NULL;
+    DestBuffer_T *dest_buffer = NULL;
     IoUringFile_T *src_file = NULL;
     IoUringFile_T *dst_file = NULL;
     struct io_uring_sqe *sqe = NULL;
@@ -628,6 +787,11 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
         dst_buffer_size = 1024;
     }
 
+    dest_buffer_size = (dst_buffer_size > DST_BUFF_LEN) ? DST_BUFF_LEN : dst_buffer_size;
+    if (dest_buffer_size % 4096 != 0) {
+        dest_buffer_size = 4096 - (dest_buffer_size % 4096) + dest_buffer_size;
+    }
+
     src_buffer = aligned_alloc(4096, src_buffer_size);
     if (src_buffer == NULL) {
         QZ_ERROR("Malloc src_buffer error.\n");
@@ -637,6 +801,12 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
     dst_buffer = malloc(dst_buffer_size);
     if (dst_buffer == NULL) {
         QZ_ERROR("Malloc dst_buffer error.\n");
+        ret = QZ7Z_ERR_MALLOC;
+        goto exit;
+    }
+    dest_buffer = generateDestBuffer(dest_buffer_size);
+    if (dest_buffer == NULL) {
+        QZ_ERROR("Malloc dest_buffer errro\n");
         ret = QZ7Z_ERR_MALLOC;
         goto exit;
     }
@@ -650,7 +820,11 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
         ret = QZ7Z_ERR_OPEN;
         goto exit;
     }
-    dst_file = generateIoUringFileWithMode(dst_file_name, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+    if (g_o_direct) {
+        dst_file = generateIoUringFileWithMode(dst_file_name, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+    } else {
+        dst_file = generateIoUringFileWithMode(dst_file_name, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+    }
     if(!dst_file) {
         QZ_ERROR("Cannot open file: %s\n", dst_file_name);
         ret = QZ7Z_ERR_OPEN;
@@ -691,18 +865,18 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
             } else {
                 bytes_read = bytes_read_temp;
             }
-            QZ_PRINT("Reading input file %s (%u Bytes)\n", src_file_name,
-                     bytes_read);
+            //QZ_PRINT("Reading input file %s (%u Bytes)\n", src_file_name,
+            //         bytes_read);
             src_file->off += bytes_read;
         } else {
             bytes_read = file_remaining;
         }
 
-        puts((is_compress) ? "Compressing..." : "Decompressing...");
+        //puts((is_compress) ? "Compressing..." : "Decompressing...");
 
-        ret = doProcessBufferIoUring(sess, src_buffer, &bytes_read, dst_buffer,
+        ret = doProcessBufferIoUringDirect(sess, src_buffer, &bytes_read, dst_buffer,
                               dst_buffer_size, time_list_head, dst_file,
-                              &dst_file_size, is_compress, ring_);
+                              &dst_file_size, is_compress, ring_, dest_buffer);
 
         if (QZ_DATA_ERROR == ret || QZ_BUF_ERROR == ret) {
             bytes_processed += bytes_read;
@@ -745,11 +919,26 @@ void doProcessFileIoUring(QzSession_T *sess, const char *src_file_name,
         file_remaining -= bytes_read;
         speed_size += bytes_read;
 
-        if (g_o_direct && bytes_read % 4096 != 0) {
+        if (g_read_o_direct && bytes_read % 4096 != 0) {
             fcntl(src_file->fd, F_SETFL, O_RDONLY);
-            g_o_direct = 0;
+            g_read_o_direct = 0;
         }
     } while (file_remaining > 0);
+
+    if (dest_buffer->off != 0) {
+        if (g_write_o_direct && dest_buffer->off % 4096 != 0) {
+            fcntl(dst_file->fd, F_SETFL, O_WRONLY | O_CREAT | O_TRUNC);
+            g_write_o_direct = 0;
+        }
+        struct io_uring_sqe *sqe = io_uring_get_sqe(ring_);
+        CHECK_GET_SQE(sqe)
+        io_uring_prep_write(sqe, dst_file->fd, dest_buffer->buffer, dest_buffer->off, dst_file->off);
+        int bytes_written = getIoUringResult(ring_);
+        CHECK_IO_URING_WRITE_RETURN(bytes_written, dest_buffer->off, "compress")
+        dst_file_size += bytes_written;
+        dst_file->off += bytes_written;
+        dest_buffer->off = 0;
+    }
 
     displayStats(time_list_head, src_file_size, dst_file_size, is_compress);
 
@@ -1126,10 +1315,28 @@ IoUringFile_T *generateIoUringFileWithMode(const char *file_name, int flags, mod
     return mallocIoUringFile(fd);
 }
 
+DestBuffer_T *generateDestBuffer(unsigned int size) {
+    void* buffer = aligned_alloc(4096, size);
+    if (buffer == NULL) {
+        return NULL;
+    }
+    DestBuffer_T* dest_buffer = malloc(sizeof(DestBuffer_T));
+    CHECK_ALLOC_RETURN_VALUE(dest_buffer);
+    dest_buffer->buffer = buffer;
+    dest_buffer->size = size;
+    dest_buffer->off = 0;
+    return dest_buffer;
+}
+
 void freeIoUringFile(IoUringFile_T *iouringf) 
 {
     close(iouringf->fd);
     free(iouringf);
+}
+
+void freeDestBuffer(DestBuffer_T* dest_buffer) {
+    free(dest_buffer->buffer);
+    free(dest_buffer);
 }
 
 ssize_t getIoUringResult(struct io_uring *ring_)

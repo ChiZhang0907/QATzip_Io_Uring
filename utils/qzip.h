@@ -170,6 +170,7 @@ typedef enum QzSuffix_E {
 } QzSuffix_T;
 
 #define SRC_BUFF_LEN         (4 * 1024 * 1024)
+#define DST_BUFF_LEN         (4 * 1024 * 1024)
 
 
 #define QZ7Z_PROPERTY_ID_INTEL7Z_1001   ((QZ7Z_DEVELOP_PREFIX << 56) | \
@@ -591,6 +592,12 @@ typedef struct IoUringFile_S {
     int fd;
     off_t off;
 } IoUringFile_T;
+
+typedef struct DestBuffer_S {
+    unsigned char* buffer;
+    unsigned int size;
+    unsigned int off;
+} DestBuffer_T;
  
 /* create a list return list head */
 QzListHead_T *qzListCreate(int num_per_node);
@@ -646,6 +653,8 @@ Qz7zEndHeader_T *generateEndHeader(Qz7zItemList_T *the_list,
 IoUringFile_T *generateIoUringFile(const char *file_name, int flags);
 IoUringFile_T *generateIoUringFileWithMode(const char *file_name, int flags, mode_t mode);
 
+DestBuffer_T *generateDestBuffer(unsigned int size);
+
 /*
  * write function
  */
@@ -674,6 +683,7 @@ void freeFilesInfo(Qz7zFilesInfo_T *info);
 void freeFilesDecInfo(Qz7zFilesInfo_Dec_T *info);
 void freeEndHeader(Qz7zEndHeader_T *eheader, int is_compress);
 void freeIoUringFile(IoUringFile_T *iouringf);
+void freeDestBuffer(DestBuffer_T *dest_buffer);
 
 
 /* the main API for compress into 7z format */
@@ -747,11 +757,16 @@ int doProcessBuffer(QzSession_T *sess,
                     unsigned char *dst, unsigned int dst_len,
                     RunTimeList_T *time_list, FILE *dst_file,
                     off_t *dst_file_size, int is_compress);
-int doProcessBufferIoUring(QzSession_T *sess,
+int doProcessBufferDirect(QzSession_T *sess,
                     unsigned char *src, unsigned int *src_len,
                     unsigned char *dst, unsigned int dst_len,
                     RunTimeList_T *time_list, IoUringFile_T *dst_file,
-                    off_t *dst_file_size, int is_compress, struct io_uring *ring_);
+                    off_t *dst_file_size, int is_compress, DestBuffer_T *dest_buffer);
+int doProcessBufferIoUringDirect(QzSession_T *sess,
+                    unsigned char *src, unsigned int *src_len,
+                    unsigned char *dst, unsigned int dst_len,
+                    RunTimeList_T *time_list, IoUringFile_T *dst_file,
+                    off_t *dst_file_size, int is_compress, struct io_uring *ring_, DestBuffer_T *dest_buffer);
 
 void doProcessFile(QzSession_T *sess, const char *src_file_name,
                    const char *dst_file_name, int is_compress);
@@ -795,5 +810,7 @@ extern const unsigned int USDM_ALLOC_MAX_SZ;
 extern int errno;
 extern struct io_uring ring;
 extern int g_o_direct;
+extern int g_read_o_direct;
+extern int g_write_o_direct;
 
 #endif
